@@ -1,3 +1,4 @@
+import { isNativeControlResponse } from "./native-response-control";
 import type { ResponsesRequestContext, ResponsesAdmissionState } from "./core-options";
 import type { PreparedResponsesRequest } from "./request-prepare";
 import type { ResponsesTransport } from "./request-transport";
@@ -15,6 +16,7 @@ import {
   relayWithAbort,
 } from "../relay";
 import { isUsageDebugEnabled } from "../../usage/debug";
+import { isReplayRefusalResponse } from "../../lib/upstream-retry";
 import { teeWithBoundedInspection } from "../inspection-tee";
 import {
   codexForwardTerminalOutcomeRecorder,
@@ -244,7 +246,12 @@ export async function deliverPassthroughResponse(
       } else if (!shouldDeferCodexResetDerivedCooldown(
         upstreamResponse,
         options.deferCodexResetDerivedCooldown,
-      )) {
+      ) && !isReplayRefusalResponse(upstreamResponse)) {
+        // A refusal this proxy made is not evidence about the account. Recording it would
+        // classify the synthetic 429 as quota exhaustion and write a default cooldown against
+        // a credential the request may never have reached, and that false signal outlives the
+        // request. The sibling recorders on this path already decline: the terminal recorder
+        // needs an ok streaming body, and the quota-header snapshot finds no quota headers.
         recordCodexUpstreamOutcome(config, admissionState.authCtx.accountId, upstreamResponse.status, {
           ...quotaMeta,
           threadId: admissionState.authCtx.affinityKey,
@@ -300,7 +307,20 @@ export async function deliverPassthroughResponse(
       return formatPassthroughUpstreamError(upstreamResponse.status, errorText, {
         statusText: upstreamResponse.statusText,
         headers,
+        // Provenance, not inference: `errorText` is empty when the bounded read finds nothing
+        // display-safe, and an empty body is exactly what the retryable-429 default fires on.
+        replayRefusal: isReplayRefusalResponse(upstreamResponse),
       });
+    }
+
+    if (options.nativeControl && isNativeControlResponse(upstreamResponse) && upstreamResponse.body) {
+      // A native chain carries several response terminals. Ordinary SSE repair,
+      // cancellation-on-terminal and local previous-response replay are single-response
+      // contracts and would truncate it. Keep the bounded upstream as the sole reader.
+      options.nativeControl.relayActive = true;
+      commitReasoningReplayServingRoute(nativeExchange.request.headers);
+      const body = trackStreamLifetime(upstreamResponse.body, upstream, undefined, options.turnAdmissionLease);
+      return new Response(body, { status: upstreamResponse.status, headers });
     }
 
     // Bun#32111 workaround: passthrough SSE uses tee()+native relay to avoid the
