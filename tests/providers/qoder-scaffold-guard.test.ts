@@ -13,18 +13,30 @@ import {
  * client as assistant text.
  */
 
-const REMINDER = "<system-reminder>MCP lazy-loading is active.\n## Connected MCP servers\n"
-  + "- internal-notes\n- deploy-keys\nUse mcp_list / mcp_get / mcp_call.</system-reminder>";
+const REMINDER =
+  "<system-reminder>MCP lazy-loading is active.\n## Connected MCP servers\n" +
+  "- internal-notes\n- deploy-keys\nUse mcp_list / mcp_get / mcp_call.</system-reminder>";
 
-const TOOL_MARKUP = "<functions.exec>\n<parameter name=\"cmd\">cd /srv/private && git status</parameter>\n</invoke>";
+const TOOL_MARKUP =
+  '<functions.exec>\n<parameter name="cmd">cd /srv/private && git status</parameter>\n</invoke>';
 
-function collect(): { events: AdapterEvent[]; emit: (event: AdapterEvent) => void } {
+function collect(): {
+  events: AdapterEvent[];
+  emit: (event: AdapterEvent) => void;
+} {
   const events: AdapterEvent[] = [];
-  return { events, emit: event => { events.push(event); } };
+  return {
+    events,
+    emit: (event) => {
+      events.push(event);
+    },
+  };
 }
 
 function textOf(events: AdapterEvent[]): string {
-  return events.map(event => (event.type === "text_delta" ? event.text : "")).join("");
+  return events
+    .map((event) => (event.type === "text_delta" ? event.text : ""))
+    .join("");
 }
 
 describe("QoderScaffoldFilter", () => {
@@ -38,11 +50,19 @@ describe("QoderScaffoldFilter", () => {
   test("catches a marker split across deltas", () => {
     const filter = new QoderScaffoldFilter();
     // The opening tag arrives in three pieces; a per-delta scan would miss it entirely.
-    const parts = ["Answer. <system", "-remin", "der>secret server list</system-reminder> Done."];
-    const out = parts.map(part => filter.push(part));
-    expect(out.every(result => result.fail === null)).toBe(true);
-    expect(out.map(result => result.text).join("") + filter.flush().text).toBe("Answer.  Done.");
-    expect(out.map(result => result.text).join("")).not.toContain("secret server list");
+    const parts = [
+      "Answer. <system",
+      "-remin",
+      "der>secret server list</system-reminder> Done.",
+    ];
+    const out = parts.map((part) => filter.push(part));
+    expect(out.every((result) => result.fail === null)).toBe(true);
+    expect(
+      out.map((result) => result.text).join("") + filter.flush().text,
+    ).toBe("Answer.  Done.");
+    expect(out.map((result) => result.text).join("")).not.toContain(
+      "secret server list",
+    );
   });
 
   test("releases a held tail that never became a marker", () => {
@@ -64,7 +84,9 @@ describe("QoderScaffoldFilter", () => {
 
   test("fails closed on a closer with no opener", () => {
     // The block it belonged to was already partly forwarded, or never existed.
-    expect(new QoderScaffoldFilter().push("tail</system-reminder>").fail).toContain("</system-reminder>");
+    expect(
+      new QoderScaffoldFilter().push("tail</system-reminder>").fail,
+    ).toContain("</system-reminder>");
   });
 
   test("does not forward the region between a suppressed block and a refusal", () => {
@@ -82,7 +104,9 @@ describe("QoderScaffoldFilter", () => {
 
   test("does not forward vendor narration that sits between a reminder and tool markup", () => {
     const filter = new QoderScaffoldFilter();
-    const result = filter.push(`Status.${REMINDER}\n- deploy-keys\n${TOOL_MARKUP}`);
+    const result = filter.push(
+      `Status.${REMINDER}\n- deploy-keys\n${TOOL_MARKUP}`,
+    );
     expect(result.text).toBe("Status.");
     expect(result.text).not.toContain("deploy-keys");
     expect(result.fail).toContain("<functions.");
@@ -112,25 +136,36 @@ describe("QoderScaffoldFilter", () => {
 
   test("counts nesting even when the tags are split across deltas", () => {
     const filter = new QoderScaffoldFilter();
-    const parts = ["<system-reminder>o<system-remin", "der>i</system-reminder>- deploy-keys</system-rem", "inder> Done."];
-    const out = parts.map(part => filter.push(part));
-    expect(out.map(result => result.text).join("")).toBe(" Done.");
-    expect(out.every(result => result.fail === null)).toBe(true);
+    const parts = [
+      "<system-reminder>o<system-remin",
+      "der>i</system-reminder>- deploy-keys</system-rem",
+      "inder> Done.",
+    ];
+    const out = parts.map((part) => filter.push(part));
+    expect(out.map((result) => result.text).join("")).toBe(" Done.");
+    expect(out.every((result) => result.fail === null)).toBe(true);
   });
 
   test("a closer with no opener forwards nothing ahead of it", () => {
     // The prefix of a stray closer is the lost block's body, not an answer that preceded it.
     const filter = new QoderScaffoldFilter();
-    const result = filter.push("## Connected MCP servers\n- deploy-keys</system-reminder>");
+    const result = filter.push(
+      "## Connected MCP servers\n- deploy-keys</system-reminder>",
+    );
     expect(result.text).toBe("");
     expect(result.fail).toContain("</system-reminder>");
-    expect(new QoderScaffoldFilter().push("cd /srv/private && git status</invoke>").text).toBe("");
+    expect(
+      new QoderScaffoldFilter().push("cd /srv/private && git status</invoke>")
+        .text,
+    ).toBe("");
   });
 
   test("catches an invoke block that carries no attributes", () => {
     // "<invoke name=" alone missed "<invoke>", so the command shipped ahead of the refusal.
     const filter = new QoderScaffoldFilter();
-    const result = filter.push("Checking.\n<invoke>\ncd /srv/private && git status\n</invoke>");
+    const result = filter.push(
+      "Checking.\n<invoke>\ncd /srv/private && git status\n</invoke>",
+    );
     expect(result.text).toBe("Checking.\n");
     expect(result.text).not.toContain("git status");
     expect(result.fail).toContain("<invoke>");
@@ -140,7 +175,9 @@ describe("QoderScaffoldFilter", () => {
     // The opener is matched without its ">", so it needs a token boundary of its own.
     const filter = new QoderScaffoldFilter();
     const result = filter.push("the <system-reminders> are documented");
-    expect(result.text + filter.flush().text).toBe("the <system-reminders> are documented");
+    expect(result.text + filter.flush().text).toBe(
+      "the <system-reminders> are documented",
+    );
     expect(result.fail).toBeNull();
   });
 
@@ -153,7 +190,10 @@ describe("QoderScaffoldFilter", () => {
   test("latches: nothing more escapes after the guard trips", () => {
     const filter = new QoderScaffoldFilter();
     expect(filter.push(TOOL_MARKUP).fail).not.toBeNull();
-    expect(filter.push("more vendor narration")).toEqual({ text: "", fail: null });
+    expect(filter.push("more vendor narration")).toEqual({
+      text: "",
+      fail: null,
+    });
     expect(filter.flush()).toEqual({ text: "", fail: null });
   });
 });
@@ -188,23 +228,29 @@ describe("guardQoderScaffolding", () => {
     expect(textOf(events)).toBe("Checking.\n");
     const terminal = events[events.length - 1]!;
     expect(terminal.type).toBe("error");
-    if (terminal.type !== "error") throw new Error("expected an error terminal");
+    if (terminal.type !== "error")
+      throw new Error("expected an error terminal");
     expect(terminal.code).toBe(QODER_SCAFFOLD_ERROR_CODE);
     expect(terminal.status).toBe(502);
     expect(terminal.retryable).toBe(false);
     expect(terminal.message).not.toContain("git status");
     expect(terminal.message).not.toContain("mcp_call");
-    expect(events.filter(event => event.type === "done")).toHaveLength(0);
+    expect(events.filter((event) => event.type === "done")).toHaveLength(0);
   });
 
   test("guards the reasoning channel independently of the text channel", () => {
     const { events, emit } = collect();
     const guarded = guardQoderScaffolding(emit);
-    guarded({ type: "thinking_delta", thinking: `Planning.${REMINDER}Continue.` });
+    guarded({
+      type: "thinking_delta",
+      thinking: `Planning.${REMINDER}Continue.`,
+    });
     guarded({ type: "text_delta", text: "Answer." });
     guarded({ type: "done", stopReason: "stop" });
-    const thinking = events.filter(event => event.type === "thinking_delta")
-      .map(event => event.type === "thinking_delta" ? event.thinking : "").join("");
+    const thinking = events
+      .filter((event) => event.type === "thinking_delta")
+      .map((event) => (event.type === "thinking_delta" ? event.thinking : ""))
+      .join("");
     expect(thinking).toBe("Planning.Continue.");
     expect(textOf(events)).toBe("Answer.");
   });
@@ -212,11 +258,19 @@ describe("guardQoderScaffolding", () => {
   test("forwards the vendor's own error rather than replacing it", () => {
     const { events, emit } = collect();
     const guarded = guardQoderScaffolding(emit);
-    guarded({ type: "text_delta", text: "partial <system-reminder>never closed" });
-    guarded({ type: "error", message: "Qoder CLI exited with code 118", status: 429 });
+    guarded({
+      type: "text_delta",
+      text: "partial <system-reminder>never closed",
+    });
+    guarded({
+      type: "error",
+      message: "Qoder CLI exited with code 118",
+      status: 429,
+    });
     const terminal = events[events.length - 1]!;
     expect(terminal.type).toBe("error");
-    if (terminal.type !== "error") throw new Error("expected an error terminal");
+    if (terminal.type !== "error")
+      throw new Error("expected an error terminal");
     // The vendor said why the turn ended; the guard's job here was only to drop the block.
     expect(terminal.message).toBe("Qoder CLI exited with code 118");
     expect(textOf(events)).toBe("partial ");
@@ -227,6 +281,27 @@ describe("guardQoderScaffolding", () => {
     const guarded = guardQoderScaffolding(emit);
     guarded({ type: "tool_call_start", id: "call_1", name: "exec" });
     guarded({ type: "done", stopReason: "stop" });
-    expect(events.map(event => event.type)).toEqual(["tool_call_start", "done"]);
+    expect(events.map((event) => event.type)).toEqual([
+      "tool_call_start",
+      "done",
+    ]);
+  });
+  test("refuses the turn when <tool_call> or <function= markup leaks into text channel", () => {
+    const { events, emit } = collect();
+    const guarded = guardQoderScaffolding(emit);
+    guarded({
+      type: "text_delta",
+      text: "<tool_call>\n<function=Bash>\n<parameter=command>echo hello</parameter>\n</function>\n</tool_call>",
+    });
+    guarded({ type: "done", stopReason: "stop" });
+    const terminal = events[events.length - 1]!;
+    expect(terminal.type).toBe("error");
+    if (terminal.type !== "error")
+      throw new Error("expected an error terminal");
+    expect(terminal.code).toBe(QODER_SCAFFOLD_ERROR_CODE);
+    expect(terminal.status).toBe(502);
+    expect(
+      events.filter((event) => event.type === "tool_call_start"),
+    ).toHaveLength(0);
   });
 });
