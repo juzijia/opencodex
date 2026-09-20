@@ -36,15 +36,31 @@ const REMINDER_CLOSE = "</system-reminder>";
  * text is not possible. A stray `</system-reminder>` with no opener is in the same class:
  * the block it belonged to was already partly forwarded, or never existed.
  */
-const UNREPAIRABLE_MARKERS = ["<functions.", "<invoke name=", "<invoke>", "</invoke>", REMINDER_CLOSE] as const;
+const UNREPAIRABLE_MARKERS = [
+  "<functions.",
+  "<function=",
+  "<tool_call>",
+  "<tool_call",
+  "</tool_call>",
+  "<invoke name=",
+  "<invoke>",
+  "</invoke>",
+  REMINDER_CLOSE,
+] as const;
 
 /** Markers that end a block rather than start one; their prefix is never an answer. */
-const CLOSING_MARKERS = new Set<string>(["</invoke>", REMINDER_CLOSE]);
+const CLOSING_MARKERS = new Set<string>([
+  "</invoke>",
+  "</tool_call>",
+  REMINDER_CLOSE,
+]);
 
 /** Every marker the scanner must be able to recognize mid-split. */
 const ALL_MARKERS = [REMINDER_OPEN, ...UNREPAIRABLE_MARKERS] as const;
 
-const MAX_MARKER_LENGTH = Math.max(...ALL_MARKERS.map(marker => marker.length));
+const MAX_MARKER_LENGTH = Math.max(
+  ...ALL_MARKERS.map((marker) => marker.length),
+);
 
 /**
  * True when `<system-reminder` at `at` is the tag rather than the start of a longer word.
@@ -143,11 +159,16 @@ export class QoderScaffoldFilter {
         if (close < 0) {
           this.suppressedChars += buffer.length;
           if (this.suppressedChars > MAX_SUPPRESSED_CHARS) {
-            return this.fail(cleared, `an unterminated ${REMINDER_OPEN}> block`);
+            return this.fail(
+              cleared,
+              `an unterminated ${REMINDER_OPEN}> block`,
+            );
           }
           // The block is discarded as it arrives; only enough tail to spot a split closer is kept.
           // The tail must cover a split opener too, now that nesting is counted.
-          this.suppressedTail = scan.slice(Math.max(0, scan.length - (MAX_MARKER_LENGTH - 1)));
+          this.suppressedTail = scan.slice(
+            Math.max(0, scan.length - (MAX_MARKER_LENGTH - 1)),
+          );
           return { text: cleared, fail: null };
         }
         buffer = scan.slice(close + REMINDER_CLOSE.length);
@@ -162,7 +183,11 @@ export class QoderScaffoldFilter {
       const lowered = buffer.toLowerCase();
       for (const marker of ALL_MARKERS) {
         let at = lowered.indexOf(marker);
-        while (at >= 0 && marker === REMINDER_OPEN && !reminderOpensHere(lowered, at)) {
+        while (
+          at >= 0 &&
+          marker === REMINDER_OPEN &&
+          !reminderOpensHere(lowered, at)
+        ) {
           at = lowered.indexOf(marker, at + 1);
         }
         if (at < 0) continue;
@@ -188,10 +213,14 @@ export class QoderScaffoldFilter {
       // publish exactly what the refusal exists to contain.
       // A closer with no opener never keeps its prefix either: the block it belonged to was
       // already partly forwarded or never existed, so the text ahead of it is that body.
-      if (!CLOSING_MARKERS.has(found) && (found === REMINDER_OPEN || !this.suppressedBlock)) {
+      if (
+        !CLOSING_MARKERS.has(found) &&
+        (found === REMINDER_OPEN || !this.suppressedBlock)
+      ) {
         cleared += buffer.slice(0, earliest);
       }
-      if (found !== REMINDER_OPEN) return this.fail(cleared, `vendor tool-call markup (${found})`);
+      if (found !== REMINDER_OPEN)
+        return this.fail(cleared, `vendor tool-call markup (${found})`);
       this.suppressedBlock = true;
       this.mode = "suppress";
       this.suppressDepth = 1;
@@ -204,7 +233,8 @@ export class QoderScaffoldFilter {
   /** Release the held tail. Call before forwarding a terminal event, never mid-stream. */
   flush(): ScaffoldFilterResult {
     if (this.failed) return { text: "", fail: null };
-    if (this.mode === "suppress") return this.fail("", `an unterminated ${REMINDER_OPEN}> block`);
+    if (this.mode === "suppress")
+      return this.fail("", `an unterminated ${REMINDER_OPEN}> block`);
     const text = this.pending;
     this.pending = "";
     return { text, fail: null };
@@ -227,7 +257,9 @@ export class QoderScaffoldFilter {
  * guard exists to contain.
  */
 export function qoderScaffoldErrorMessage(reason: string): string {
-  return `Qoder CLI emitted ${reason} in the assistant text channel. This route runs the CLI with`
-    + " its own tools and MCP servers disabled and Codex owns tool control, so the turn was refused"
-    + " rather than forwarding vendor agent scaffolding to the client.";
+  return (
+    `Qoder CLI emitted ${reason} in the assistant text channel. This route runs the CLI with` +
+    " its own tools and MCP servers disabled and Codex owns tool control, so the turn was refused" +
+    " rather than forwarding vendor agent scaffolding to the client."
+  );
 }

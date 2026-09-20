@@ -1,4 +1,9 @@
-import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxUsage } from "../../types";
+import type {
+  AdapterEvent,
+  OcxMessage,
+  OcxParsedRequest,
+  OcxUsage,
+} from "../../types";
 
 /**
  * Shared stream-json protocol for official coding-agent CLIs (CodeBuddy Code and Qoder CLI).
@@ -62,7 +67,9 @@ export async function* readJsonLines(
 
   const flushLine = function* (line: string): Generator<StreamMessage> {
     if (encoder.encode(line).byteLength > maxLineBytes) {
-      throw new CodingAgentStreamLimitError("Coding-agent stream line exceeded the byte ceiling");
+      throw new CodingAgentStreamLimitError(
+        "Coding-agent stream line exceeded the byte ceiling",
+      );
     }
     const trimmed = line.trim();
     if (!trimmed) return; // Blank lines and whitespace-only lines are ignored as padding.
@@ -75,7 +82,11 @@ export async function* readJsonLines(
         `Malformed stream-json frame received from coding-agent CLI: ${snippet}`,
       );
     }
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
+    ) {
       const snippet = trimmed.slice(0, 64).replace(/[\r\n]+/g, " ");
       throw new CodingAgentProtocolError(
         `Non-object stream-json frame received from coding-agent CLI: ${snippet}`,
@@ -87,7 +98,9 @@ export async function* readJsonLines(
   for await (const chunk of chunks) {
     totalBytes += chunk.byteLength;
     if (totalBytes > maxTotalBytes) {
-      throw new CodingAgentStreamLimitError("Coding-agent stream exceeded the total byte ceiling");
+      throw new CodingAgentStreamLimitError(
+        "Coding-agent stream exceeded the total byte ceiling",
+      );
     }
     buffer += decoder.decode(chunk, { stream: true });
     let newline = buffer.indexOf("\n");
@@ -98,7 +111,9 @@ export async function* readJsonLines(
       newline = buffer.indexOf("\n");
     }
     if (encoder.encode(buffer).byteLength > maxLineBytes) {
-      throw new CodingAgentStreamLimitError("Coding-agent stream line exceeded the byte ceiling");
+      throw new CodingAgentStreamLimitError(
+        "Coding-agent stream line exceeded the byte ceiling",
+      );
     }
   }
   // Flush the decoder's trailing bytes and any final line without a newline terminator.
@@ -107,30 +122,97 @@ export async function* readJsonLines(
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-/** Extract OpenCodex usage from a `result` frame's Anthropic-shaped usage object. */
-export function usageFromResult(message: StreamMessage): OcxUsage | undefined {
-  const usage = asRecord(message.usage);
-  if (!usage) return undefined;
-  const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
-  const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
-  const cachedInputTokens = typeof usage.cache_read_input_tokens === "number" ? usage.cache_read_input_tokens : undefined;
+/** Extract OpenCodex usage from the Anthropic-shaped usage record shared by frames and deltas. */
+function usageFromAnthropicShape(
+  usage: Record<string, unknown>,
+): OcxUsage | undefined {
+  const inputTokens =
+    typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
+  const outputTokens =
+    typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
+  const cachedInputTokens =
+    typeof usage.cache_read_input_tokens === "number"
+      ? usage.cache_read_input_tokens
+      : undefined;
   const cacheCreationInputTokens =
-    typeof usage.cache_creation_input_tokens === "number" ? usage.cache_creation_input_tokens : undefined;
-  if (inputTokens === 0 && outputTokens === 0 && cachedInputTokens === undefined) return undefined;
+    typeof usage.cache_creation_input_tokens === "number"
+      ? usage.cache_creation_input_tokens
+      : undefined;
+  if (
+    inputTokens === 0 &&
+    outputTokens === 0 &&
+    cachedInputTokens === undefined
+  )
+    return undefined;
   return {
     inputTokens,
     outputTokens,
     totalTokens: inputTokens + outputTokens,
-    ...(cachedInputTokens !== undefined ? { cachedInputTokens, cacheReadInputTokens: cachedInputTokens } : {}),
-    ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
+    ...(cachedInputTokens === undefined
+      ? {}
+      : { cachedInputTokens, cacheReadInputTokens: cachedInputTokens }),
+    ...(cacheCreationInputTokens === undefined
+      ? {}
+      : { cacheCreationInputTokens }),
   };
+}
+
+/** Extract OpenCodex usage from a `result` frame's Anthropic-shaped usage object. */
+export function usageFromResult(message: StreamMessage): OcxUsage | undefined {
+  const usage = asRecord(message.usage);
+  return usage ? usageFromAnthropicShape(usage) : undefined;
+}
+
+/**
+ * Fold a pre-result usage snapshot into the running partial usage.
+ *
+ * `message_delta` and assistant-frame snapshots are cumulative per message, but a later snapshot
+ * can repeat or extend an earlier one, so each field keeps its maximum. The `result` frame stays
+ * authoritative for a text-only turn; partial state exists so a capture-only tool-bridge turn —
+ * which is terminated at `message_stop` before any result frame can arrive — still reports real
+ * token usage instead of zero.
+ */
+function mergePartialUsage(
+  previous: OcxUsage | undefined,
+  next: OcxUsage,
+): OcxUsage {
+  if (!previous) return next;
+  const inputTokens = Math.max(previous.inputTokens, next.inputTokens);
+  const outputTokens = Math.max(previous.outputTokens, next.outputTokens);
+  const cacheRead = Math.max(
+    previous.cacheReadInputTokens ?? previous.cachedInputTokens ?? 0,
+    next.cacheReadInputTokens ?? next.cachedInputTokens ?? 0,
+  );
+  const cacheCreation = Math.max(
+    previous.cacheCreationInputTokens ?? 0,
+    next.cacheCreationInputTokens ?? 0,
+  );
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    ...(cacheRead > 0
+      ? { cachedInputTokens: cacheRead, cacheReadInputTokens: cacheRead }
+      : {}),
+    ...(cacheCreation > 0 ? { cacheCreationInputTokens: cacheCreation } : {}),
+  };
+}
+
+/** Record one usage snapshot; absent, malformed, or zero-only snapshots leave state untouched. */
+function observePartialUsage(state: StreamParseState, value: unknown): void {
+  const usage = asRecord(value);
+  if (!usage) return;
+  const next = usageFromAnthropicShape(usage);
+  if (next) state.partialUsage = mergePartialUsage(state.partialUsage, next);
 }
 
 /**
@@ -142,6 +224,12 @@ export interface StreamParseState {
   sawPartialThinking: boolean;
   sawTerminalResult: boolean;
   openToolCallId?: string;
+  /** A `message_stop` stream event arrived: the assistant message is complete. */
+  sawMessageStop?: boolean;
+  /** Completed tool_use content blocks observed in this stream. */
+  completedToolCalls?: number;
+  /** Highest-seen usage snapshot from `message_delta`/assistant frames before a terminal result. */
+  partialUsage?: OcxUsage;
 }
 
 /**
@@ -151,7 +239,10 @@ export interface StreamParseState {
  * the complete `assistant` frame is only used as a fallback when no partial deltas were seen, so text
  * and thinking are never emitted twice.
  */
-export function mapStreamMessageToEvents(message: StreamMessage, state: StreamParseState): AdapterEvent[] {
+export function mapStreamMessageToEvents(
+  message: StreamMessage,
+  state: StreamParseState,
+): AdapterEvent[] {
   const type = asString(message.type);
   const events: AdapterEvent[] = [];
 
@@ -164,7 +255,8 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
   if (type === "assistant") {
     // Fallback path: a complete assistant message. Surface text and thinking independently
     // only when the partial delta stream did not already carry them (§十二).
-    const content = asRecord(message.message)?.content;
+    const messageRecord = asRecord(message.message);
+    const content = messageRecord?.content;
     if (Array.isArray(content)) {
       for (const block of content) {
         const part = asRecord(block);
@@ -179,31 +271,56 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
         }
       }
     }
+    observePartialUsage(state, messageRecord?.usage);
     return events;
   }
 
   if (type === "result") {
-    const isError = message.is_error === true || asString(message.subtype) === "error_during_execution";
+    const isError =
+      message.is_error === true ||
+      asString(message.subtype) === "error_during_execution";
     const usage = usageFromResult(message);
     if (isError) {
       const errors = Array.isArray(message.errors)
-        ? message.errors.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+        ? message.errors.filter(
+            (value): value is string =>
+              typeof value === "string" && value.trim().length > 0,
+          )
         : [];
-      const detail = asString(message.result) || errors[0] || "Coding-agent CLI ended the turn with an execution error";
-      const vendorCode = typeof message.error_code === "number" ? message.error_code : undefined;
+      const detail =
+        asString(message.result) ||
+        errors[0] ||
+        "Coding-agent CLI ended the turn with an execution error";
+      const vendorCode =
+        typeof message.error_code === "number" ? message.error_code : undefined;
       // Qoder documents code 118 and emits the "credit usage limit" wording. Keep the
       // match deliberately narrow so other coding-agent CLIs retain their established
       // generic-upstream handling for ambiguous text such as "insufficient credits".
-      const insufficientQuota = vendorCode === 118 || /credit usage limit/i.test(detail);
+      const insufficientQuota =
+        vendorCode === 118 || /credit usage limit/i.test(detail);
       // Anchor to credential verdicts. A bare "authentication" substring also matches upstream
       // service-degradation text, and a false 401 drives reauth messaging and key-pool rotation.
-      const authentication = /not logged in|invalid (?:personal access )?token|authentication (?:failed|error|required)|unauthorized/i.test(detail);
-      const rateLimited = !insufficientQuota && /rate limit|too many requests/i.test(detail);
-      const modelUnavailable = /model (?:is )?(?:not found|unavailable|unsupported)|invalid model/i.test(detail);
+      const authentication =
+        /not logged in|invalid (?:personal access )?token|authentication (?:failed|error|required)|unauthorized/i.test(
+          detail,
+        );
+      const rateLimited =
+        !insufficientQuota && /rate limit|too many requests/i.test(detail);
+      const modelUnavailable =
+        /model (?:is )?(?:not found|unavailable|unsupported)|invalid model/i.test(
+          detail,
+        );
       events.push({
         type: "error",
         message: detail,
-        status: insufficientQuota || rateLimited ? 429 : authentication ? 401 : modelUnavailable ? 400 : 502,
+        status:
+          insufficientQuota || rateLimited
+            ? 429
+            : authentication
+              ? 401
+              : modelUnavailable
+                ? 400
+                : 502,
         errorType: insufficientQuota
           ? "insufficient_quota"
           : rateLimited
@@ -228,7 +345,11 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
       return events;
     }
     state.sawTerminalResult = true;
-    events.push({ type: "done", ...(usage ? { usage } : {}), stopReason: "stop" });
+    events.push({
+      type: "done",
+      ...(usage ? { usage } : {}),
+      stopReason: "stop",
+    });
     return events;
   }
 
@@ -237,7 +358,10 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
 }
 
 /** Map a raw Anthropic SSE event (carried inside a `stream_event` frame) to AdapterEvents. */
-function mapRawStreamEvent(event: StreamMessage, state: StreamParseState): AdapterEvent[] {
+function mapRawStreamEvent(
+  event: StreamMessage,
+  state: StreamParseState,
+): AdapterEvent[] {
   const events: AdapterEvent[] = [];
   const eventType = asString(event.type);
 
@@ -257,10 +381,12 @@ function mapRawStreamEvent(event: StreamMessage, state: StreamParseState): Adapt
         events.push({ type: "thinking_delta", thinking });
       }
     } else if (deltaType === "input_json_delta") {
-      // Tool-input streaming. Inert while tools are disabled (Codex's catalog is not advertised),
-      // but parsed so the seam is ready and an unexpected frame never crashes.
+      // Tool-input streaming. Live for capture-only bridge turns, where the advertised MCP
+      // catalog makes the CLI emit real tool_use blocks; parsed unconditionally so a stray
+      // frame on a tools-disabled turn is ignored rather than crashing.
       const partial = asString(delta?.partial_json);
-      if (partial && state.openToolCallId) events.push({ type: "tool_call_delta", arguments: partial });
+      if (partial && state.openToolCallId)
+        events.push({ type: "tool_call_delta", arguments: partial });
     }
     return events;
   }
@@ -281,12 +407,64 @@ function mapRawStreamEvent(event: StreamMessage, state: StreamParseState): Adapt
   if (eventType === "content_block_stop") {
     if (state.openToolCallId) {
       state.openToolCallId = undefined;
+      state.completedToolCalls = (state.completedToolCalls ?? 0) + 1;
       events.push({ type: "tool_call_end" });
     }
     return events;
   }
 
+  if (eventType === "message_stop") {
+    state.sawMessageStop = true;
+    return events;
+  }
+
+  if (eventType === "message_start") {
+    // Anthropic-shaped streams report input tokens on `message_start.message.usage` and output
+    // tokens later on `message_delta.usage`. A capture-only tool leg is terminated at
+    // `message_stop`, so without this branch the synthesized done(tool_use) undercounts input
+    // tokens whenever the CLI puts them here (and `message_stop` arrives before any assistant
+    // fallback frame that would otherwise carry them).
+    const messageRecord = asRecord(event.message);
+    observePartialUsage(state, messageRecord?.usage);
+    return events;
+  }
+
+  if (eventType === "message_delta") {
+    // Pre-result usage snapshots: a capture-only tool-bridge turn ends at message_stop with no
+    // result frame, so these snapshots are the only token accounting that leg will ever see.
+    observePartialUsage(state, event.usage);
+    return events;
+  }
+
   return events;
+}
+
+/**
+ * Validate a `system/init` frame against an active capture-only tool bridge.
+ *
+ * With the bridge armed, the CLI must report exactly the bridge's MCP server as connected: a
+ * missing or failed server means the model never saw the advertised catalog, so the turn fails
+ * closed instead of silently degrading to a text-only answer.
+ */
+export function toolBridgeInitError(
+  message: StreamMessage,
+  serverName: string,
+): string | undefined {
+  if (message.type !== "system" || message.subtype !== "init") return undefined;
+  const servers = message.mcp_servers;
+  if (!Array.isArray(servers) || servers.length !== 1) {
+    return "Coding-agent system/init reported an unexpected MCP server set for the tool bridge.";
+  }
+  const server = servers[0];
+  if (
+    !server ||
+    typeof server !== "object" ||
+    server.name !== serverName ||
+    server.status !== "connected"
+  ) {
+    return `Coding-agent system/init did not report the ${serverName} MCP server as connected.`;
+  }
+  return undefined;
 }
 
 /** One content part on the stream-json input wire (Anthropic message shape). */
@@ -299,16 +477,24 @@ function textPart(text: string): WireContentPart {
 /** Encode an OpenCodex image content part as an Anthropic base64/url image block; never drop it. */
 function imagePart(imageUrl: string): WireContentPart | undefined {
   const match = /^data:([^;]+);base64,(.+)$/s.exec(imageUrl);
-  if (match) return { type: "image", source: { type: "base64", media_type: match[1], data: match[2] } };
-  if (/^https?:\/\//i.test(imageUrl)) return { type: "image", source: { type: "url", url: imageUrl } };
+  if (match)
+    return {
+      type: "image",
+      source: { type: "base64", media_type: match[1], data: match[2] },
+    };
+  if (/^https?:\/\//i.test(imageUrl))
+    return { type: "image", source: { type: "url", url: imageUrl } };
   return undefined;
 }
 
 function formatMessageForHistory(message: OcxMessage): string {
   if (message.role === "user") {
-    const text = typeof message.content === "string"
-      ? message.content
-      : message.content.map(p => (p.type === "text" ? p.text : `[${p.type}]`)).join("\n");
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : message.content
+            .map((p) => (p.type === "text" ? p.text : `[${p.type}]`))
+            .join("\n");
     return `USER:\n${text}`;
   }
   if (message.role === "assistant") {
@@ -320,15 +506,20 @@ function formatMessageForHistory(message: OcxMessage): string {
         parts.push(`[Thinking: ${part.thinking.trim()}]`);
       } else if (part.type === "toolCall") {
         const args = JSON.stringify(part.arguments ?? {});
-        parts.push(`[Tool call: ${part.name} (call_id: ${part.id}) with args: ${args}]`);
+        parts.push(
+          `[Tool call: ${part.name} (call_id: ${part.id}) with args: ${args}]`,
+        );
       }
     }
     return `ASSISTANT:\n${parts.join("\n") || "(empty response)"}`;
   }
   if (message.role === "toolResult") {
-    const text = typeof message.content === "string"
-      ? message.content
-      : message.content.map(p => (p.type === "text" ? p.text : "[image]")).join("");
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : message.content
+            .map((p) => (p.type === "text" ? p.text : "[image]"))
+            .join("");
     const status = message.isError ? " (error)" : "";
     return `TOOL RESULT (call_id: ${message.toolCallId})${status}:\n${text}`;
   }
@@ -365,20 +556,27 @@ export function buildInputLines(message: OcxMessage): string[] {
     if (formatted) content.push(textPart(formatted));
   }
 
-  return content.length > 0 ? [JSON.stringify({ type: "user", message: { role: "user", content } })] : [];
+  return content.length > 0
+    ? [JSON.stringify({ type: "user", message: { role: "user", content } })]
+    : [];
 }
 
 /** Fold the request's system + developer prompts into one system-prompt string. */
-export function buildSystemPrompt(parsed: OcxParsedRequest): string | undefined {
+export function buildSystemPrompt(
+  parsed: OcxParsedRequest,
+): string | undefined {
   const parts: string[] = [];
   for (const line of parsed.context.systemPrompt ?? []) {
     if (line && line.trim()) parts.push(line);
   }
   for (const message of parsed.context.messages) {
     if (message.role !== "developer") continue;
-    const text = typeof message.content === "string"
-      ? message.content
-      : message.content.map(part => (part.type === "text" ? part.text : "")).join("");
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : message.content
+            .map((part) => (part.type === "text" ? part.text : ""))
+            .join("");
     if (text.trim()) parts.push(text);
   }
   return parts.length > 0 ? parts.join("\n\n") : undefined;
@@ -396,9 +594,14 @@ export function buildSystemPrompt(parsed: OcxParsedRequest): string | undefined 
  * clearly demarcated from the current user request. Codex retains tool control; vendor tools are never invoked.
  */
 export function buildConversationInput(parsed: OcxParsedRequest): string[] {
-  const nonDev = parsed.context.messages.filter(m => m.role !== "developer");
+  const nonDev = parsed.context.messages.filter((m) => m.role !== "developer");
   if (nonDev.length === 0) {
-    return [JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: "" }] } })];
+    return [
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: [{ type: "text", text: "" }] },
+      }),
+    ];
   }
 
   if (nonDev.length === 1 && nonDev[0]!.role === "user") {
@@ -453,14 +656,19 @@ export function buildConversationInput(parsed: OcxParsedRequest): string[] {
     } else {
       const segments: string[] = [];
       for (const part of currentMessage.content) {
-        if (part.type === "text") { segments.push(part.text); continue; }
+        if (part.type === "text") {
+          segments.push(part.text);
+          continue;
+        }
         if (part.type === "image") {
           // Carry the real image instead of flattening it to a marker. The provenance
           // note stays so the prose still reads coherently and the model can tell which
           // attachment the tool produced; the bytes travel as an image block, never as text.
           const image = imagePart(part.imageUrl);
-          if (image) { currentImageBlocks.push(image); segments.push("[image attached below]"); }
-          else segments.push("[image omitted: unsupported reference]");
+          if (image) {
+            currentImageBlocks.push(image);
+            segments.push("[image attached below]");
+          } else segments.push("[image omitted: unsupported reference]");
           continue;
         }
         segments.push("[video]");
@@ -473,16 +681,26 @@ export function buildConversationInput(parsed: OcxParsedRequest): string[] {
     currentRequestText = formatMessageForHistory(currentMessage);
   }
 
-  const imageBlocks: WireContentPart[] = [...historyImageBlocks, ...currentImageBlocks];
+  const imageBlocks: WireContentPart[] = [
+    ...historyImageBlocks,
+    ...currentImageBlocks,
+  ];
 
-  let historyText = historyMessages.map(formatMessageForHistory).filter(Boolean).join("\n\n");
+  let historyText = historyMessages
+    .map(formatMessageForHistory)
+    .filter(Boolean)
+    .join("\n\n");
   if (historyText.length > MAX_PROJECTED_HISTORY_CHARS) {
-    historyText = `[Earlier conversation history truncated for length...]\n\n` +
+    historyText =
+      `[Earlier conversation history truncated for length...]\n\n` +
       historyText.slice(historyText.length - MAX_PROJECTED_HISTORY_CHARS);
   }
 
   const combinedText = `Prior conversation context:\n\n${historyText}\n\nCurrent user request:\n\n${currentRequestText}`;
 
-  const content: WireContentPart[] = [{ type: "text", text: combinedText }, ...imageBlocks];
+  const content: WireContentPart[] = [
+    { type: "text", text: combinedText },
+    ...imageBlocks,
+  ];
   return [JSON.stringify({ type: "user", message: { role: "user", content } })];
 }
