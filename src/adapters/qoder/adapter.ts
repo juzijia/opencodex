@@ -4,6 +4,9 @@ import type {
   OcxProviderConfig,
 } from "../../types";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { AdapterRequest, ProviderAdapter } from "../base";
 import { mapReasoningEffort } from "../../reasoning-effort";
 import { buildSystemPrompt } from "../coding-agent/protocol";
@@ -50,11 +53,36 @@ export function buildQoderChildEnv(
   return { ...baseScopedEnv(), NO_COLOR: "1", [profile.tokenEnv]: apiKey };
 }
 
-/** Single-shot, tools-disabled Qoder CLI invocation; Codex remains the tool owner. */
+/**
+ * Fold the request's system + developer prompts plus the optional tool-bridge nudge into
+ * one system-prompt string. Separated from arg building so the content never enters argv.
+ */
+export function buildQoderSystemPromptText(
+  parsed: OcxParsedRequest,
+  toolBridge?: Pick<CodeBuddyToolBridge, "tools">,
+): string | undefined {
+  const systemParts: string[] = [];
+  const system = buildSystemPrompt(parsed);
+  if (system) systemParts.push(system);
+  if (toolBridge && toolBridge.tools.length > 0)
+    systemParts.push(TOOL_BRIDGE_SYSTEM_PROMPT);
+  return systemParts.length > 0 ? systemParts.join("\n\n") : undefined;
+}
+
+/**
+ * Single-shot, tools-disabled Qoder CLI invocation; Codex remains the tool owner.
+ *
+ * System prompt content never enters argv: the Qoder CLI reads appended system prompt
+ * text from a file via `--append-system-prompt-file <path>` (verified in the 1.1.59
+ * bundle: `Sfo(inline, file)` falls back to `readFileSync` when no inline text is
+ * given). Only the private file path is placed on argv; the caller writes the file
+ * and owns its cleanup. No path means no system prompt arg is emitted (no inline text).
+ */
 export function buildQoderArgs(
   parsed: OcxParsedRequest,
   provider: OcxProviderConfig,
   toolBridge?: Pick<CodeBuddyToolBridge, "tools">,
+  systemPromptFilePath?: string,
 ): string[] {
   const args = [
     "-p",
@@ -79,13 +107,8 @@ export function buildQoderArgs(
     parsed.options.reasoning,
   );
   if (effort) args.push("--reasoning-effort", effort);
-  const systemParts: string[] = [];
-  const system = buildSystemPrompt(parsed);
-  if (system) systemParts.push(system);
-  if (toolBridge && toolBridge.tools.length > 0)
-    systemParts.push(TOOL_BRIDGE_SYSTEM_PROMPT);
-  if (systemParts.length > 0)
-    args.push("--append-system-prompt", systemParts.join("\n\n"));
+  if (buildQoderSystemPromptText(parsed, toolBridge) && systemPromptFilePath)
+    args.push("--append-system-prompt-file", systemPromptFilePath);
   return args;
 }
 
@@ -224,23 +247,68 @@ export function createQoderAdapter(
               captureMode: "side-channel",
             }
           : undefined;
-      await runCodingAgentTurn({
-        profiles: QODER_PROFILES,
-        provider,
+      // System prompt content never enters argv (#5270). The Qoder CLI accepts an
+      // appended system prompt from a file (`--append-system-prompt-file <path>`);
+      // write the folded system + developer + tool-bridge text to a private temp file
+      // (0600 inside a private mkdtemp dir) and hand argv only the path. The dir is
+      // removed in the finally below once the turn (and its child) has settled.
+      const systemPromptText = buildQoderSystemPromptText(
         parsed,
-        incoming,
-        emit: guardQoderScaffolding(emit),
-        ...(bridgeInput ? { toolBridge: bridgeInput } : {}),
-        buildArgs: (_profile, req, prov) =>
-          buildQoderArgs(
-            req,
-            prov,
-            toolBridge.tools.length > 0 ? toolBridge : undefined,
-          ),
-        buildEnv: (profile, apiKey) =>
-          buildQoderChildEnv(profile as QoderProfile, apiKey),
-        deps,
-      });
+        toolBridge.tools.length > 0 ? toolBridge : undefined,
+      );
+      let systemPromptDir: string | undefined;
+      let systemPromptFilePath: string | undefined;
+      if (systemPromptText) {
+        try {
+          systemPromptDir = await mkdtemp(
+            join(tmpdir(), "ocx-qoder-system-prompt-"),
+          );
+          systemPromptFilePath = join(systemPromptDir, "system-prompt.txt");
+          await writeFile(systemPromptFilePath, systemPromptText, {
+            encoding: "utf8",
+            mode: 0o600,
+          });
+        } catch (err) {
+          emit({
+            type: "error",
+            message: `Failed to prepare the Qoder system prompt file: ${err instanceof Error ? err.message : String(err)}`,
+            status: 500,
+            errorType: "server_error",
+            code: "tool_bridge_setup_failed",
+            retryable: false,
+          });
+          if (systemPromptDir)
+            await rm(systemPromptDir, { recursive: true, force: true }).catch(
+              () => undefined,
+            );
+          return;
+        }
+      }
+      try {
+        await runCodingAgentTurn({
+          profiles: QODER_PROFILES,
+          provider,
+          parsed,
+          incoming,
+          emit: guardQoderScaffolding(emit),
+          ...(bridgeInput ? { toolBridge: bridgeInput } : {}),
+          buildArgs: (_profile, req, prov) =>
+            buildQoderArgs(
+              req,
+              prov,
+              toolBridge.tools.length > 0 ? toolBridge : undefined,
+              systemPromptFilePath,
+            ),
+          buildEnv: (profile, apiKey) =>
+            buildQoderChildEnv(profile as QoderProfile, apiKey),
+          deps,
+        });
+      } finally {
+        if (systemPromptDir)
+          await rm(systemPromptDir, { recursive: true, force: true }).catch(
+            () => undefined,
+          );
+      }
     },
   };
 }
