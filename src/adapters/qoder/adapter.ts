@@ -15,7 +15,7 @@ import {
   CODEBUDDY_MCP_SERVER_NAME,
   CODEBUDDY_TOOL_LIMITS,
   type CodeBuddyToolBridge,
-} from "../coding-agent/tool-bridge";
+} from "./tool-bridge";
 import { QODER_PROFILES, type QoderProfile } from "./profiles";
 import { QoderScaffoldFilter, QODER_SCAFFOLD_ERROR_CODE, qoderScaffoldErrorMessage } from "./scaffold-guard";
 
@@ -23,7 +23,7 @@ export type { SpawnFn } from "../coding-agent/turn";
 export type QoderAdapterDeps = CodingAgentDeps;
 
 export const QODER_MCP_SERVER_NAME = CODEBUDDY_MCP_SERVER_NAME;
-const QODER_MCP_SERVER_PATH = fileURLToPath(new URL("../coding-agent/mcp-server.ts", import.meta.url));
+const QODER_MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.ts", import.meta.url));
 
 const TOOL_BRIDGE_SYSTEM_PROMPT = [
   "Your built-in tools and user-configured MCP servers are disabled.",

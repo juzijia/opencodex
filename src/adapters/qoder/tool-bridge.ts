@@ -16,13 +16,9 @@ export const CODEBUDDY_MCP_TOOL_PREFIX = `mcp__${CODEBUDDY_MCP_SERVER_NAME}__`;
 // crowd the transcript and system prompt out of the request budget.
 export const CODEBUDDY_TOOL_LIMITS = Object.freeze({
   maxTools: 128,
-  // Captured tool_use blocks accepted in a single assistant turn. Kimi emits
-  // parallel calls as sibling content blocks of one assistant message, all
-  // streamed before message_stop; the capture-only MCP handler never returns,
-  // so every block must be observed before the parent terminates the turn.
-  // Each captured call is fully buffered under the per-call translator
-  // budget, so this bound also caps per-turn capture memory.
-  maxTurnToolCalls: 16,
+  // Side-channel v1 accepts exactly one tool call per Qoder invocation.
+  // Later calls use Responses continuation and a new stateless invocation.
+  maxTurnToolCalls: 1,
   maxNameBytes: 512,
   maxDescriptionBytes: 64 * 1024,
   maxSchemaBytes: 224 * 1024,
@@ -760,13 +756,3 @@ export function buildCodingAgentToolBridge(
 }
 
 export { buildToolBridge };
-
-export const MAX_CAPTURE_BYTES = 256 * 1024;
-
-export interface ToolBridgeCapturePayload {
-  version: 1;
-  nonce: string;
-  sequence: number;
-  name: string;
-  arguments: Record<string, unknown>;
-}

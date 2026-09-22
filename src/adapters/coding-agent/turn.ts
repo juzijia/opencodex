@@ -7,12 +7,11 @@ import { watch, type FSWatcher } from "node:fs";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import type { JsonSchemaType } from "@modelcontextprotocol/sdk/validation";
 import { toolChoiceToolPredicate } from "../../types";
-import { MAX_CAPTURE_BYTES, type ToolBridgeCapturePayload } from "./tool-bridge";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../types";
 import { commandInvocation } from "../../lib/win-exec";
 import { modelRecordValue } from "../../reasoning-effort";
 import type { IncomingMeta } from "../base";
-import { buildConversationInput, CodingAgentProtocolError, mapStreamMessageToEvents, projectedHistoryCharLimit, readJsonLines, toolBridgeInitError, type StreamParseState } from "./protocol";
+import { buildConversationInput, CodingAgentProtocolError, mapStreamMessageToEvents, MAX_CAPTURE_BYTES, projectedHistoryCharLimit, readJsonLines, toolBridgeInitError, type StreamParseState, type ToolBridgeCapturePayload } from "./protocol";
 import { resolveCodingAgentBinary, resolveProfileByBaseUrl, type CodingAgentProviderProfile, type WhichFn } from "./profile";
 
 /** Injectable spawn for tests; production uses node:child_process. */
@@ -128,7 +127,10 @@ export interface CodingAgentToolBridgeInput {
   tools: ReadonlyArray<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
   /** CLI-emitted tool name (`mcp__<server>__<tool>`) to the request's wire tool name. */
   emittedNameMap: Map<string, string>;
-  /** Captured tool_use blocks accepted in one assistant message. */
+  /**
+   * Captured tool_use blocks accepted in one assistant message. Side-channel v1 bridges accept
+   * exactly one tool call per invocation; continuation requests start a new invocation.
+   */
   maxTurnToolCalls: number;
   /**
    * The request's `tool_choice` requires a tool call (`required`, or a named selection).
@@ -415,7 +417,16 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
 
   let streamProtocolError: string | undefined;
   let turnError: string | undefined;
-  const captureCommitted = false;
+  // One mutable capture-lifecycle flag for the whole turn: set once the side-channel capture path
+  // emits its terminal (joined tool-call emission or a fail-closed capture error). Declared here so
+  // the post-reap tail observes the same state the stream loop wrote; the previous outer const /
+  // inner let shadowing is gone.
+  let captureCommitted = false;
+  // Side-channel join halves: the native streamed tool_use identity and the validated MCP capture
+  // record are collected independently; the client sees exactly one emission once both halves are
+  // present and agree on the wire tool identity.
+  let nativeToolCall: { id: string; wireName: string } | undefined;
+  let capturedToolCall: { wireName: string; arguments: Record<string, unknown> } | undefined;
   const state: StreamParseState = {
     sawPartialText: false,
     sawPartialThinking: false,
@@ -441,16 +452,61 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     }
     const stdout = child.stdout;
     if (!stdout) throw new CodingAgentProtocolError(`${profile.label} CLI produced no stdout stream`);
-    let sideChannelCaptured = false;
-    let captureCommitted = false;
-    let seenCaptureSequence = 0;
+    let acceptedCaptureFile: string | undefined;
+    // Emits the joined side-channel tool call exactly once: only when the native streamed
+    // tool_use id and the validated MCP capture record are both present and name the same wire
+    // tool. Never synthesizes a call id; a half that never arrives fails closed at turn end.
+    const commitSideChannelCapture = (): void => {
+      if (captureCommitted || terminalEmitted || !toolBridge) return;
+      const native = nativeToolCall;
+      const captured = capturedToolCall;
+      if (!native || !captured) return;
+      if (native.wireName !== captured.wireName) {
+        captureCommitted = true;
+        stopSideChannel();
+        emitOnce({
+          type: "error",
+          message: "Coding-agent CLI streamed a tool identity that does not match the MCP capture record.",
+          status: 502,
+          errorType: "upstream_error",
+          code: "protocol_error",
+          retryable: false,
+        });
+        kill();
+        stopStream();
+        return;
+      }
+      captureCommitted = true;
+      stopSideChannel();
+      emitOnce({ type: "tool_call_start", id: native.id, name: native.wireName });
+      emitOnce({ type: "tool_call_delta", arguments: JSON.stringify(captured.arguments) });
+      emitOnce({ type: "tool_call_end" });
+      emitOnce({
+        type: "done",
+        stopReason: "tool_use",
+        endTurn: false,
+        ...(state.partialUsage ? { usage: state.partialUsage } : {}),
+      });
+      kill();
+      stopStream();
+    };
     const checkSideChannel = async (): Promise<void> => {
-      if (sideChannelCaptured || captureCommitted || terminalEmitted || incoming.abortSignal?.aborted || !toolBridge || !toolBridgeDir) return;
+      if (captureCommitted || terminalEmitted || incoming.abortSignal?.aborted || !toolBridge || !toolBridgeDir) return;
       try {
         const files = await readdir(toolBridgeDir);
         const captureFiles = files.filter(f => f.startsWith("capture-") && f.endsWith(".json")).sort();
         for (const file of captureFiles) {
-          if (sideChannelCaptured || captureCommitted || terminalEmitted || incoming.abortSignal?.aborted) break;
+          if (captureCommitted || terminalEmitted || incoming.abortSignal?.aborted) break;
+          if (acceptedCaptureFile !== undefined) {
+            if (file === acceptedCaptureFile) continue;
+            // A second distinct capture record violates the one-call-per-invocation contract.
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: "Invalid MCP capture sequence.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
           const filePath = join(toolBridgeDir, file);
           let content: string;
           try {
@@ -459,7 +515,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             continue;
           }
           if (Buffer.byteLength(content, "utf8") > MAX_CAPTURE_BYTES) {
-            sideChannelCaptured = true;
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: "MCP capture record exceeds byte limit.", status: 502, errorType: "upstream_error", code: "tool_call_limit", retryable: false });
@@ -471,7 +526,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           try {
             payload = JSON.parse(content);
           } catch {
-            sideChannelCaptured = true;
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: "Malformed MCP capture record.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
@@ -480,7 +534,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             break;
           }
           if (payload.version !== 1 || payload.nonce !== captureNonce) {
-            sideChannelCaptured = true;
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: "MCP capture nonce mismatch.", status: 502, errorType: "upstream_error", code: "tool_bridge_init_mismatch", retryable: false });
@@ -492,10 +545,8 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             typeof payload.sequence !== "number" ||
             !Number.isSafeInteger(payload.sequence) ||
             payload.sequence !== 1 ||
-            file !== `capture-${payload.sequence}.json` ||
-            seenCaptureSequence !== 0
+            file !== `capture-${payload.sequence}.json`
           ) {
-            sideChannelCaptured = true;
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: "Invalid MCP capture sequence.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
@@ -503,9 +554,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             stopStream();
             break;
           }
-          seenCaptureSequence = payload.sequence;
           if (payload.arguments === null || typeof payload.arguments !== "object" || Array.isArray(payload.arguments)) {
-            sideChannelCaptured = true;
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: "MCP capture record has invalid arguments.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
@@ -518,7 +567,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
               ? toolBridge.emittedNameMap.get(`mcp__${toolBridge.serverName}__${payload.name}`)
               : undefined);
           if (wireName === undefined) {
-            sideChannelCaptured = true;
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: "Coding-agent CLI called a tool outside the isolated catalog.", status: 502, errorType: "upstream_error", code: "undeclared_tool_call", retryable: false });
@@ -528,7 +576,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           }
           const choice = parsed.options.toolChoice;
           if (choice === "none") {
-            sideChannelCaptured = true;
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: "Coding-agent CLI called a tool when tool_choice is none.", status: 502, errorType: "upstream_error", code: "undeclared_tool_call", retryable: false });
@@ -540,7 +587,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           const predicate = toolChoiceToolPredicate(choice, allTools);
           const matchingTool = allTools.find(t => (t.namespace ? `${t.namespace}.${t.name}` : t.name) === wireName);
           if (!matchingTool || !predicate(matchingTool)) {
-            sideChannelCaptured = true;
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: `Tool ${wireName} was called but tool_choice disallowed it.`, status: 502, errorType: "upstream_error", code: "tool_call_required", retryable: false });
@@ -554,7 +600,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             `mcp__opencodex__${t.name}` === payload.name,
           );
           if (!advertisedTool) {
-            sideChannelCaptured = true;
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: "Coding-agent CLI called a tool outside the isolated catalog.", status: 502, errorType: "upstream_error", code: "undeclared_tool_call", retryable: false });
@@ -573,7 +618,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             validationError = err instanceof Error ? err.message : "schema compilation failed";
           }
           if (validationError) {
-            sideChannelCaptured = true;
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: `MCP tool arguments failed schema validation: ${validationError}`, status: 502, errorType: "upstream_error", code: "invalid_tool_arguments", retryable: false });
@@ -581,16 +625,9 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             stopStream();
             break;
           }
-          sideChannelCaptured = true;
-          captureCommitted = true;
-          stopSideChannel();
-          const clientCallId = state.openToolCallId ?? `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-          emitOnce({ type: "tool_call_start", id: clientCallId, name: wireName });
-          emitOnce({ type: "tool_call_delta", arguments: JSON.stringify(payload.arguments) });
-          emitOnce({ type: "tool_call_end" });
-          emitOnce({ type: "done", stopReason: "tool_use", endTurn: false });
-          kill();
-          stopStream();
+          acceptedCaptureFile = file;
+          capturedToolCall = { wireName, arguments: payload.arguments };
+          commitSideChannelCapture();
           break;
         }
       } catch {
@@ -625,8 +662,60 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           }
           if (message.type === "system" && message.subtype === "init") initValidated = true;
         }
+        if (toolBridge?.captureMode === "side-channel") {
+          await checkSideChannel();
+          if (captureCommitted) break;
+        }
         for (const event of mapStreamMessageToEvents(message, state)) {
-          if (captureCommitted || sideChannelCaptured) break;
+          if (captureCommitted) break;
+          // Side-channel v1: streamed tool_use frames never reach the client directly. They only
+          // supply the native tool identity half of the join; the capture record supplies the
+          // validated name+arguments half, and commitSideChannelCapture emits the single joined
+          // tool_call sequence once both halves agree.
+          if (toolBridge?.captureMode === "side-channel" && event.type === "tool_call_start") {
+            toolCallStarts += 1;
+            if (toolCallStarts > 1) {
+              emitOnce({ type: "error", message: "Coding-agent CLI returned more than the 1-tool-call side-channel limit.", status: 502, errorType: "upstream_error", code: "tool_call_limit", retryable: false });
+              failClosed = true;
+              kill();
+              break;
+            }
+            const wireName = toolBridge.emittedNameMap.get(event.name);
+            if (wireName === undefined) {
+              emitOnce({ type: "error", message: "Coding-agent CLI called a tool outside the isolated catalog.", status: 502, errorType: "upstream_error", code: "undeclared_tool_call", retryable: false });
+              failClosed = true;
+              kill();
+              break;
+            }
+            nativeToolCall = { id: event.id, wireName };
+            commitSideChannelCapture();
+            continue;
+          }
+          if (toolBridge?.captureMode === "side-channel" && (event.type === "tool_call_delta" || event.type === "tool_call_end")) {
+            continue;
+          }
+          if (
+            toolBridge?.captureMode === "side-channel" &&
+            event.type === "done" &&
+            (nativeToolCall !== undefined || capturedToolCall !== undefined)
+          ) {
+            const missing = nativeToolCall === undefined
+              ? "the native tool-use identity was never streamed"
+              : "the MCP capture record never arrived";
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({
+              type: "error",
+              message: `Coding-agent side-channel tool capture is incomplete: ${missing}.`,
+              status: 502,
+              errorType: "upstream_error",
+              code: "protocol_error",
+              retryable: false,
+            });
+            failClosed = true;
+            kill();
+            break;
+          }
           if (toolBridge && event.type === "tool_call_start") {
             toolCallStarts += 1;
             if (toolCallStarts > toolBridge.maxTurnToolCalls) {
@@ -656,7 +745,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             // become a successful completion the client can accept. The capture-only bridge has no
             // way to force the nested CLI, so fail closed with the same stable error shape the
             // other bridge contract violations use.
-            emitOnce({ type: "error", message: "CodeBuddy finished without calling the required tool.", status: 502, errorType: "upstream_error", code: "tool_call_required", retryable: false });
+            emitOnce({ type: "error", message: `${profile.label} finished without calling the required tool.`, status: 502, errorType: "upstream_error", code: "tool_call_required", retryable: false });
             failClosed = true;
             kill();
             break;
@@ -664,6 +753,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           emitOnce(event.type === "error"
             ? { ...event, message: redactSecrets(event.message, profile.tokenEnv, apiKey) }
             : event);
+        }
+        if (toolBridge?.captureMode === "side-channel") {
+          commitSideChannelCapture();
+          if (captureCommitted) break;
         }
         if (failClosed) break;
         if (
@@ -681,6 +774,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
         }
         if (
           toolBridge &&
+          toolBridge.captureMode !== "side-channel" &&
           !terminalEmitted &&
           state.sawMessageStop &&
           (state.completedToolCalls ?? 0) > 0
@@ -705,6 +799,11 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           break;
         }
         if (terminalEmitted) break;
+      }
+      // A short-lived fake or vendor process can close stdout before the watcher/poll callback
+      // runs. Read the capture directory once more while it still exists, then join or fail closed.
+      if (!captureCommitted && toolBridge?.captureMode === "side-channel") {
+        await checkSideChannel();
       }
     } catch (err) {
       kill();
@@ -774,6 +873,20 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
         status: 502,
         errorType: "upstream_error",
         code: "process_exit_error",
+        retryable: false,
+      });
+    } else if (toolBridge?.captureMode === "side-channel" && (nativeToolCall !== undefined || capturedToolCall !== undefined)) {
+      // Side-channel fail-closed: one join half arrived but the other never did. Never emit a
+      // partial tool call and never synthesize the missing id.
+      const missing = nativeToolCall === undefined
+        ? "the native tool-use identity was never streamed"
+        : "the MCP capture record never arrived";
+      emitOnce({
+        type: "error",
+        message: `Coding-agent side-channel tool capture is incomplete: ${missing}.`,
+        status: 502,
+        errorType: "upstream_error",
+        code: "protocol_error",
         retryable: false,
       });
     } else if (!state.sawTerminalResult) {

@@ -4,7 +4,7 @@ import {
   CODEBUDDY_TOOL_LIMITS as QODER_TOOL_LIMITS,
   buildToolBridge as buildQoderToolBridge,
   codeBuddyToolAlias as qoderToolAlias,
-} from "../../src/adapters/coding-agent/tool-bridge";
+} from "../../src/adapters/qoder/tool-bridge";
 import type { OcxParsedRequest, OcxTool, OcxToolChoice } from "../../src/types";
 
 function tool(name: string, options: Partial<OcxTool> = {}): OcxTool {

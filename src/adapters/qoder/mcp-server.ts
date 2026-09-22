@@ -18,9 +18,11 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import {
   CODEBUDDY_TOOL_LIMITS,
+} from "./tool-bridge";
+import {
   MAX_CAPTURE_BYTES,
   type ToolBridgeCapturePayload,
-} from "./tool-bridge";
+} from "../coding-agent/protocol";
 
 interface ToolDefinition {
   name: string;

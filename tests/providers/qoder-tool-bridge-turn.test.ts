@@ -15,7 +15,7 @@ import {
   createQoderAdapter,
   type SpawnFn,
 } from "../../src/adapters/qoder/adapter";
-import { buildToolBridge as buildQoderToolBridge } from "../../src/adapters/coding-agent/tool-bridge";
+import { buildToolBridge as buildQoderToolBridge } from "../../src/adapters/qoder/tool-bridge";
 import {
   QODER_GLOBAL_PROFILE,
   clearQoderBinaryCache,
@@ -162,8 +162,35 @@ const BLOCK_STOP = {
 };
 const MESSAGE_STOP = { type: "stream_event", event: { type: "message_stop" } };
 
+function captureConfig(args: readonly string[]): {
+  captureDir: string;
+  nonce: string;
+} {
+  const mcpIdx = args.indexOf("--mcp-config");
+  expect(mcpIdx).toBeGreaterThanOrEqual(0);
+  const config = JSON.parse(readFileSync(args[mcpIdx + 1]!, "utf8"));
+  const env = config.mcpServers.opencodex.env;
+  return {
+    captureDir: env.OCX_MCP_CAPTURE_DIR as string,
+    nonce: env.OCX_MCP_CAPTURE_NONCE as string,
+  };
+}
+
+function writeCaptureFile(
+  captureDir: string,
+  nonce: string,
+  sequence: number,
+  name: string,
+  callArgs: Record<string, unknown>,
+): void {
+  const payload = { version: 1, nonce, sequence, name, arguments: callArgs };
+  const tmpFile = join(captureDir, `.test-${sequence}.tmp`);
+  writeFileSync(tmpFile, JSON.stringify(payload), "utf8");
+  renameSync(tmpFile, join(captureDir, `capture-${sequence}.json`));
+}
+
 describe("Qoder capture-only tool bridge turn", () => {
-  test("advertises the catalog, captures the call, renames it, and ends the leg at message_stop", async () => {
+  test("advertises the catalog and commits the native call without waiting for message_stop", async () => {
     const p = parsed([tool("exec")]);
     const bridge = buildQoderToolBridge(p);
     const cliName = [...bridge.emittedNameMap.keys()][0]!;
@@ -173,16 +200,12 @@ describe("Qoder capture-only tool bridge turn", () => {
     let seenArgs: readonly string[] = [];
     const spawn: SpawnFn = (_cmd, args) => {
       seenArgs = args;
+      const { captureDir, nonce } = captureConfig(args);
+      writeCaptureFile(captureDir, nonce, 1, bridge.tools[0]!.name, { a: 1 });
       child = fakeChild(
         frameLines([
           INIT_OK,
           toolUseStart(cliName),
-          inputJsonDelta('{"a":'),
-          inputJsonDelta("1}"),
-          BLOCK_STOP,
-          MESSAGE_STOP,
-          // Deliberately no result frame: in production the CLI parks on the
-          // never-answering capture server after message_stop.
         ]),
       );
       return child as unknown as ChildProcess;
@@ -207,7 +230,6 @@ describe("Qoder capture-only tool bridge turn", () => {
     expect(events.map((e) => e.type)).toEqual([
       "tool_call_start",
       "tool_call_delta",
-      "tool_call_delta",
       "tool_call_end",
       "done",
     ]);
@@ -215,7 +237,7 @@ describe("Qoder capture-only tool bridge turn", () => {
       type: "tool_call_start",
       name: wireName,
     });
-    expect(events[4]).toMatchObject({
+    expect(events[3]).toMatchObject({
       type: "done",
       stopReason: "tool_use",
       endTurn: false,
@@ -241,12 +263,14 @@ describe("Qoder capture-only tool bridge turn", () => {
     expect(events.at(-1)).toMatchObject({ type: "done" });
   });
 
-  test("a tool-bridge turn reports the partial usage observed before message_stop", async () => {
+  test("a tool-bridge turn reports partial usage observed before side-channel commit", async () => {
     const p = parsed([tool("exec")]);
     const bridge = buildQoderToolBridge(p);
     const cliName = [...bridge.emittedNameMap.keys()][0]!;
-    const spawn: SpawnFn = (_cmd, _args) =>
-      fakeChild(
+    const spawn: SpawnFn = (_cmd, args) => {
+      const { captureDir, nonce } = captureConfig(args);
+      writeCaptureFile(captureDir, nonce, 1, bridge.tools[0]!.name, { a: 1 });
+      return fakeChild(
         frameLines([
           INIT_OK,
           {
@@ -258,24 +282,9 @@ describe("Qoder capture-only tool bridge turn", () => {
             },
           },
           toolUseStart(cliName),
-          inputJsonDelta("{}"),
-          BLOCK_STOP,
-          {
-            type: "stream_event",
-            event: {
-              type: "message_delta",
-              delta: {},
-              usage: {
-                input_tokens: 15,
-                output_tokens: 4,
-                cache_read_input_tokens: 3,
-              },
-            },
-          },
-          MESSAGE_STOP,
-          // No result frame: the CLI parks on the never-answering capture server after message_stop.
         ]),
       ) as unknown as ChildProcess;
+    };
     const adapter = createQoderAdapter(provider(), {
       spawn,
       which: () => "/usr/bin/qoder",
@@ -286,11 +295,9 @@ describe("Qoder capture-only tool bridge turn", () => {
       stopReason: "tool_use",
       endTurn: false,
       usage: {
-        inputTokens: 15,
+        inputTokens: 12,
         outputTokens: 5,
-        totalTokens: 20,
-        cachedInputTokens: 3,
-        cacheReadInputTokens: 3,
+        totalTokens: 17,
       },
     });
   });
@@ -299,8 +306,10 @@ describe("Qoder capture-only tool bridge turn", () => {
     const p = parsed([tool("exec")]);
     const bridge = buildQoderToolBridge(p);
     const cliName = [...bridge.emittedNameMap.keys()][0]!;
-    const spawn: SpawnFn = (_cmd, _args) =>
-      fakeChild(
+    const spawn: SpawnFn = (_cmd, args) => {
+      const { captureDir, nonce } = captureConfig(args);
+      writeCaptureFile(captureDir, nonce, 1, bridge.tools[0]!.name, { a: 1 });
+      return fakeChild(
         frameLines([
           INIT_OK,
           {
@@ -311,19 +320,9 @@ describe("Qoder capture-only tool bridge turn", () => {
             },
           },
           toolUseStart(cliName),
-          inputJsonDelta("{}"),
-          BLOCK_STOP,
-          {
-            type: "stream_event",
-            event: {
-              type: "message_delta",
-              delta: {},
-              usage: { input_tokens: 31, output_tokens: 6 },
-            },
-          },
-          MESSAGE_STOP,
         ]),
       ) as unknown as ChildProcess;
+    };
     const adapter = createQoderAdapter(provider(), {
       spawn,
       which: () => "/usr/bin/qoder",
@@ -332,7 +331,7 @@ describe("Qoder capture-only tool bridge turn", () => {
     expect(events.at(-1)).toMatchObject({
       type: "done",
       stopReason: "tool_use",
-      usage: { inputTokens: 31, outputTokens: 6, totalTokens: 37 },
+      usage: { inputTokens: 31, outputTokens: 0, totalTokens: 31 },
     });
   });
 
@@ -539,13 +538,15 @@ describe("Qoder capture-only tool bridge turn", () => {
 
 
 
-  test("partial stream path remains compatible and waits for message_stop", async () => {
+  test("partial stream path commits the native id without waiting for message_stop", async () => {
     const p = parsed([tool("Bash")]);
     const bridge = buildQoderToolBridge(p);
     const cliName = [...bridge.emittedNameMap.keys()][0];
     const partialNativeId = "call_partial_stream_id_777";
-    const spawn = (_cmd, _args) =>
-      fakeChild(
+    const spawn: SpawnFn = (_cmd, args) => {
+      const { captureDir, nonce } = captureConfig(args);
+      writeCaptureFile(captureDir, nonce, 1, bridge.tools[0]!.name, { a: 1 });
+      return fakeChild(
         frameLines([
           INIT_OK,
           {
@@ -559,24 +560,9 @@ describe("Qoder capture-only tool bridge turn", () => {
               },
             },
           },
-          {
-            type: "stream_event",
-            event: {
-              type: "content_block_delta",
-              delta: { type: "input_json_delta", partial_json: '{"a":1}' },
-            },
-          },
-          {
-            type: "stream_event",
-            event: { type: "content_block_stop" },
-          },
-          // message_stop arrives at the end
-          {
-            type: "stream_event",
-            event: { type: "message_stop" },
-          },
         ]),
-      );
+      ) as unknown as ChildProcess;
+    };
     const adapter = createQoderAdapter(provider(), {
       spawn,
       which: () => "/usr/bin/qoder",
@@ -590,4 +576,216 @@ describe("Qoder capture-only tool bridge turn", () => {
     expect(done.stopReason).toBe("tool_use");
   });
 
+});
+
+describe("Qoder side-channel capture", () => {
+  function manualChild(): {
+    child: FakeChild;
+    push: (frame: unknown | null) => void;
+  } {
+    const child = new EventEmitter() as FakeChild;
+    const out = new Readable({ read() {} });
+    child.stdout = out;
+    child.stderr = Readable.from([]);
+    child.stdin = new Writable({
+      write(_chunk, _encoding, cb) {
+        cb();
+      },
+    });
+    child.killed = false;
+    child.exitCode = null;
+    child.kill = () => {
+      child.killed = true;
+      setTimeout(() => {
+        child.exitCode = 0;
+        child.emit("close", 0);
+      }, 5);
+      return true;
+    };
+    const push = (frame: unknown | null): void => {
+      if (frame === null) {
+        out.push(null);
+        setTimeout(() => {
+          if (!child.killed && child.exitCode === null) {
+            child.exitCode = 0;
+            child.emit("close", 0);
+          }
+        }, 10);
+        return;
+      }
+      out.push(enc.encode(JSON.stringify(frame) + "\n"));
+    };
+    return { child, push };
+  }
+
+  function sideChannelCase(): {
+    p: OcxParsedRequest;
+    cliName: string;
+    wireName: string;
+    alias: string;
+  } {
+    const p = parsed([tool("exec")]);
+    const bridge = buildQoderToolBridge(p);
+    const cliName = [...bridge.emittedNameMap.keys()][0]!;
+    const wireName = bridge.emittedNameMap.get(cliName)!;
+    const alias = bridge.tools[0]!.name;
+    return { p, cliName, wireName, alias };
+  }
+
+  function expectSingleCapturedCall(
+    events: AdapterEvent[],
+    nativeId: string,
+    wireName: string,
+  ): void {
+    expect(events.map((e) => e.type)).toEqual([
+      "tool_call_start",
+      "tool_call_delta",
+      "tool_call_end",
+      "done",
+    ]);
+    expect(events.filter((e) => e.type === "tool_call_start")).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "tool_call_start",
+      id: nativeId,
+      name: wireName,
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      stopReason: "tool_use",
+      endTurn: false,
+    });
+  }
+
+  test("capture arrives first, native id later: waits and emits once with native id", async () => {
+    const { p, cliName, wireName, alias } = sideChannelCase();
+    const spawn: SpawnFn = (_cmd, args) => {
+      const { captureDir, nonce } = captureConfig(args);
+      writeCaptureFile(captureDir, nonce, 1, alias, { a: 1 });
+      const { child, push } = manualChild();
+      setTimeout(() => {
+        push(INIT_OK);
+        push(toolUseStart(cliName, "tu_native_9"));
+        push(null);
+      }, 100);
+      return child as unknown as ChildProcess;
+    };
+    const adapter = createQoderAdapter(provider(), {
+      spawn,
+      which: () => "/usr/bin/qoder",
+    });
+    const events = await run(adapter, p);
+    expectSingleCapturedCall(events, "tu_native_9", wireName);
+  });
+
+  test("native id arrives first, capture later: emits once", async () => {
+    const { p, cliName, wireName, alias } = sideChannelCase();
+    const spawn: SpawnFn = (_cmd, args) => {
+      const { captureDir, nonce } = captureConfig(args);
+      const { child, push } = manualChild();
+      push(INIT_OK);
+      push(toolUseStart(cliName, "tu_first_1"));
+      push(inputJsonDelta('{"a":1}'));
+      push(BLOCK_STOP);
+      setTimeout(
+        () => writeCaptureFile(captureDir, nonce, 1, alias, { a: 1 }),
+        120,
+      );
+      setTimeout(() => push(null), 200);
+      return child as unknown as ChildProcess;
+    };
+    const adapter = createQoderAdapter(provider(), {
+      spawn,
+      which: () => "/usr/bin/qoder",
+    });
+    const events = await run(adapter, p);
+    expectSingleCapturedCall(events, "tu_first_1", wireName);
+  });
+
+  test("native id never arrives: fails closed without synthetic id", async () => {
+    const { p, alias } = sideChannelCase();
+    const spawn: SpawnFn = (_cmd, args) => {
+      const { captureDir, nonce } = captureConfig(args);
+      writeCaptureFile(captureDir, nonce, 1, alias, { a: 1 });
+      const { child, push } = manualChild();
+      push(INIT_OK);
+      push(null);
+      return child as unknown as ChildProcess;
+    };
+    const adapter = createQoderAdapter(provider(), {
+      spawn,
+      which: () => "/usr/bin/qoder",
+    });
+    const events = await run(adapter, p);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      code: "protocol_error",
+    });
+    expect(events.some((e) => e.type === "tool_call_start")).toBe(false);
+    expect(JSON.stringify(events)).not.toMatch(/call_[0-9a-f]{24}/);
+  });
+
+  test("sequence=2 capture fails closed", async () => {
+    const { p, cliName, alias } = sideChannelCase();
+    const spawn: SpawnFn = (_cmd, args) => {
+      const { captureDir, nonce } = captureConfig(args);
+      writeCaptureFile(captureDir, nonce, 2, alias, { a: 1 });
+      const { child, push } = manualChild();
+      push(INIT_OK);
+      push(toolUseStart(cliName, "tu_seq_2"));
+      push(inputJsonDelta('{"a":1}'));
+      push(BLOCK_STOP);
+      push(null);
+      return child as unknown as ChildProcess;
+    };
+    const adapter = createQoderAdapter(provider(), {
+      spawn,
+      which: () => "/usr/bin/qoder",
+    });
+    const events = await run(adapter, p);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      code: "protocol_error",
+    });
+    expect(events.some((e) => e.type === "tool_call_start")).toBe(false);
+  });
+
+  test("successful capture emits exactly one terminal and no trailing error", async () => {
+    const { p, cliName, wireName, alias } = sideChannelCase();
+    const spawn: SpawnFn = (_cmd, args) => {
+      const { captureDir, nonce } = captureConfig(args);
+      writeCaptureFile(captureDir, nonce, 1, alias, { a: 1 });
+      const { child, push } = manualChild();
+      push(INIT_OK);
+      push(toolUseStart(cliName, "tu_once_1"));
+      push(null);
+      return child as unknown as ChildProcess;
+    };
+    const adapter = createQoderAdapter(provider(), {
+      spawn,
+      which: () => "/usr/bin/qoder",
+    });
+    const events = await run(adapter, p);
+    expect(events.filter((e) => e.type === "done")).toHaveLength(1);
+    expect(events.filter((e) => e.type === "error")).toHaveLength(0);
+    expectSingleCapturedCall(events, "tu_once_1", wireName);
+  });
+
+  test("required-tool error message is provider-neutral", async () => {
+    const { p } = sideChannelCase();
+    p.options = { toolChoice: "required" } as OcxParsedRequest["options"];
+    const spawn: SpawnFn = () =>
+      fakeChild([
+        enc.encode('{"type":"result","subtype":"success"}\n'),
+      ]) as unknown as ChildProcess;
+    const adapter = createQoderAdapter(provider(), {
+      spawn,
+      which: () => "/usr/bin/qoder",
+    });
+    const events = await run(adapter, p);
+    const last = events.at(-1)! as { message?: unknown };
+    expect(last).toMatchObject({ type: "error", code: "tool_call_required" });
+    const message = String(last.message ?? JSON.stringify(last));
+    expect(message).toContain("Qoder");
+    expect(message).not.toContain("CodeBuddy");
+  });
 });

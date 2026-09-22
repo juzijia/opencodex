@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CODEBUDDY_TOOL_LIMITS } from "../../src/adapters/coding-agent/tool-bridge";
+import { CODEBUDDY_TOOL_LIMITS } from "../../src/adapters/qoder/tool-bridge";
 
 const tempDirs: string[] = [];
 const serverPath = join(
@@ -13,7 +13,7 @@ const serverPath = join(
   "..",
   "src",
   "adapters",
-  "coding-agent",
+  "qoder",
   "mcp-server.ts",
 );
 

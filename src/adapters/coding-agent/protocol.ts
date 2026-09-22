@@ -216,6 +216,17 @@ export interface StreamParseState {
   partialUsage?: OcxUsage;
 }
 
+/** Shared wire contract for a capture-only MCP bridge side channel. */
+export const MAX_CAPTURE_BYTES = 256 * 1024;
+
+export interface ToolBridgeCapturePayload {
+  version: 1;
+  nonce: string;
+  sequence: number;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
 /**
  * Map ONE protocol frame to zero or more AdapterEvents.
  *
