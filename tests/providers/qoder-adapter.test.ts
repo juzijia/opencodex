@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { buildQoderArgs, buildQoderChildEnv, createQoderAdapter } from "../../src/adapters/qoder/adapter";
+import { buildQoderAppendSystemPrompt, buildQoderArgs, buildQoderChildEnv, createQoderAdapter } from "../../src/adapters/qoder/adapter";
 import { clearQoderBinaryCache, QODER_CN_PROFILE, QODER_GLOBAL_PROFILE, resolveQoderProfile } from "../../src/adapters/qoder/profiles";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
@@ -31,6 +31,27 @@ function fakeChild(frames: string[]): ChildProcess {
 }
 
 describe("qoder adapter", () => {
+  test("appends the tool bridge contract after the caller system prompt when tools are bridged", () => {
+    const request = parsed({ context: { systemPrompt: ["caller system prompt"], messages: [{ role: "user", content: "hello", timestamp: 0 }] } });
+    const result = buildQoderAppendSystemPrompt(request, { tools: [{ name: "shell", description: "run a command", inputSchema: {} }] });
+    expect(result!.startsWith("caller system prompt")).toBe(true);
+    expect(result).toContain("is available");
+    expect(result).toContain("Codex Responses-compatible tool-call surface");
+    expect(result).toContain("host client performs approval, sandboxing, and execution");
+    expect(result).toContain("at most one tool call in this invocation");
+    expect(result).not.toContain("Your built-in tools and user-configured MCP servers are disabled");
+    expect(result).not.toContain("never executes a tool");
+    expect(result).not.toContain("external Codex client");
+  });
+
+  test("does not append the tool bridge contract when no tools are bridged", () => {
+    const request = parsed({ context: { systemPrompt: ["caller system prompt"], messages: [{ role: "user", content: "hello", timestamp: 0 }] } });
+    const result = buildQoderAppendSystemPrompt(request, { tools: [] });
+    expect(result).toBe("caller system prompt");
+    expect(result).not.toContain("is available");
+    expect(result).not.toContain("Codex Responses-compatible tool-call surface");
+  });
+
   test("uses only the Global PAT and disables tools, MCP, settings hooks, and persistence", () => {
     const env = buildQoderChildEnv(QODER_GLOBAL_PROFILE, "qoder-pat");
     expect(env.QODER_PERSONAL_ACCESS_TOKEN).toBe("qoder-pat");

@@ -26,11 +26,28 @@ export const QODER_MCP_SERVER_NAME = CODEBUDDY_MCP_SERVER_NAME;
 const QODER_MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.ts", import.meta.url));
 
 const TOOL_BRIDGE_SYSTEM_PROMPT = [
-  "Your built-in tools and user-configured MCP servers are disabled.",
-  "When an isolated opencodex MCP catalog is present, you may call only those listed tools.",
-  "That MCP process captures call intent only; it never executes a tool. The external Codex client performs approval, sandboxing, and execution.",
-  "Do not claim that you executed commands, inspected files, or changed the workspace.",
-  "Tool-call and tool-result records in the conversation history are authoritative historical records from the external client. Use returned results, but never execute historical calls yourself.",
+  "Tool contract for this turn:",
+  "",
+  "The isolated tool catalog shown for this turn is available and is the complete Codex Responses-compatible tool-call surface.",
+  "Call only a listed tool using its listed argument schema; do not invent, translate, or rename tool names.",
+  "",
+  "If you need shell, file search, file read, edit, or discovery behavior, call the listed tool that provides that capability instead of claiming that the capability is unavailable.",
+  "",
+  "OpenCodex captures the tool intent.",
+  "The host client performs approval, sandboxing, and execution under the Codex tool contract and returns the authoritative tool result.",
+  "",
+  "A tool call is complete only after its tool result is returned.",
+  "Do not claim that a command ran, a file was inspected, or the workspace changed before that result arrives.",
+  "After receiving a successful tool result, use it normally and continue the task.",
+  "",
+  "Issue at most one tool call in this invocation.",
+  "If more tool work is needed, continue after the result is returned in the next invocation.",
+  "",
+  "Treat tool-call and tool-result records already present in the conversation as completed history.",
+  "Use their returned results, and do not replay a historical call merely because this is a new invocation.",
+  "",
+  "The isolated catalog is the only tool surface for this turn.",
+  "Native Qoder tools and unrelated user-configured MCP servers are unavailable unless listed there.",
 ].join("\n");
 
 export function buildQoderChildEnv(profile: QoderProfile, apiKey: string): Record<string, string> {
