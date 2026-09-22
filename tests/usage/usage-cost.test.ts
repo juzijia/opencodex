@@ -328,8 +328,8 @@ describe("resolveMatchedPrice", () => {
     expect(resolveMatchedPrice("openrouter", "anthropic-claude-3.5-sonnet")).toBeNull();
   });
 
-  test("16. shipped overlay membership: 126 keys, including canonical Fable 5.1, Opus 5, OpenCode Go and compatibility prices", () => {
-    expect(EXPECTED_PRICE_OVERLAYS.length).toBe(126);
+  test("16. shipped overlay membership: 127 keys, including canonical Fable 5.1, Opus 5, OpenCode Go and compatibility prices", () => {
+    expect(EXPECTED_PRICE_OVERLAYS.length).toBe(127);
     expect(EXPECTED_PRICE_OVERLAYS.some(row => row.status === "unverified")).toBe(false);
     const keys = new Set(EXPECTED_PRICE_OVERLAYS.map(row => `${row.provider}/${row.modelId}`));
     for (const expected of [
@@ -403,6 +403,9 @@ describe("resolveMatchedPrice", () => {
       // vendor's published list price as a verified-derived estimate.
       "opencode-go/qwen3.8-max",
       "opencode-go/qwen3.8-flash",
+      // Qoder is an account-billed surface with no jawcode bundle row, so it carries
+      // its own derived overlay or the Usage cost column stays empty.
+      "qoder/Qwen3.8-Flash",
       "opencode-go/deepseek-v4.1-flash",
       "opencode-go/glm-5.3-flash",
       "opencode-go/muse-spark-1.3-contributor",

@@ -1,9 +1,18 @@
 import { execFileSync, spawn as nodeSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { mkdtemp, rm, writeFile, readdir, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { watch, type FSWatcher } from "node:fs";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
+import type { JsonSchemaType } from "@modelcontextprotocol/sdk/validation";
+import { toolChoiceToolPredicate } from "../../types";
+import { MAX_CAPTURE_BYTES, type ToolBridgeCapturePayload } from "./tool-bridge";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../types";
 import { commandInvocation } from "../../lib/win-exec";
 import { modelRecordValue } from "../../reasoning-effort";
 import type { IncomingMeta } from "../base";
-import { buildConversationInput, CodingAgentProtocolError, mapStreamMessageToEvents, projectedHistoryCharLimit, readJsonLines, type StreamParseState } from "./protocol";
+import { buildConversationInput, CodingAgentProtocolError, mapStreamMessageToEvents, projectedHistoryCharLimit, readJsonLines, toolBridgeInitError, type StreamParseState } from "./protocol";
 import { resolveCodingAgentBinary, resolveProfileByBaseUrl, type CodingAgentProviderProfile, type WhichFn } from "./profile";
 
 /** Injectable spawn for tests; production uses node:child_process. */
@@ -26,12 +35,15 @@ export interface CodingAgentDeps {
   platform?: NodeJS.Platform;
   /** Test seam for terminating a Windows CLI and all descendants. */
   killWindowsProcessTree?: KillWindowsProcessTreeFn;
+  /** Optional working directory for the spawned CLI process; defaults to process.cwd(). */
+  cwd?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
 /** Bound captured stderr so an error message can never carry an unbounded (or secret) payload. */
 const MAX_STDERR_BYTES = 8 * 1024;
+const toolArgumentSchemaValidator = new AjvJsonSchemaValidator();
 
 function killWindowsProcessTree(pid: number): void {
   const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
@@ -88,7 +100,46 @@ export interface CodingAgentTurnInput {
   buildArgs: (profile: CodingAgentProviderProfile, parsed: OcxParsedRequest, provider: OcxProviderConfig) => string[];
   /** Family-specific scoped env builder (credential + region switch on top of baseScopedEnv). */
   buildEnv: (profile: CodingAgentProviderProfile, apiKey: string) => Record<string, string>;
+  /**
+   * Opt-in capture-only tool bridge. When present with a non-empty catalog, the turn writes a
+   * validated catalog plus an MCP config to a private temp dir, passes `--mcp-config` (with exact
+   * `--allowedTools`) alongside the family's tools-disabled args, translates captured tool_use
+   * names back to request wire names, and terminates the process tree at `message_stop` because
+   * the capture-only MCP handler intentionally never answers. Execution stays with the client.
+   */
+  toolBridge?: CodingAgentToolBridgeInput;
+  /** Optional custom stream-json stdin lines generator; defaults to buildConversationInput(parsed). */
+  buildInputLines?: (parsed: OcxParsedRequest) => string[];
+  /**
+   * System prompt text appended to the vendor default, delivered through a 0600 temp file and
+   * --append-system-prompt-file so the prompt never appears in argv. Cleaned up with the turn.
+   */
+  appendSystemPrompt?: string;
   deps: CodingAgentDeps;
+}
+
+/** Opt-in capture-only tool bridge for one coding-agent CLI turn. */
+export interface CodingAgentToolBridgeInput {
+  /** MCP server name advertised to the CLI; tool_use blocks render it as `mcp__<name>__<tool>`. */
+  serverName: string;
+  /** Absolute path of the capture-only MCP server module, run with the serving runtime. */
+  serverModulePath: string;
+  /** Validated tool catalog advertised over ListTools; the server never executes a call. */
+  tools: ReadonlyArray<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
+  /** CLI-emitted tool name (`mcp__<server>__<tool>`) to the request's wire tool name. */
+  emittedNameMap: Map<string, string>;
+  /** Captured tool_use blocks accepted in one assistant message. */
+  maxTurnToolCalls: number;
+  /**
+   * The request's `tool_choice` requires a tool call (`required`, or a named selection).
+   * The nested CLI has no documented force-tool flag, so this is enforced locally: a
+   * terminal text result on a required turn fails closed instead of silently succeeding.
+   */
+  requireToolCall?: boolean;
+  /** Flag name used by vendor CLI to allow tools. Defaults to "--allowedTools". */
+  allowedToolsFlag?: "--allowedTools" | "--allowed-tools";
+  /** Tool bridge capture lifecycle mode. Defaults to "message_stop". Qoder uses "side-channel". */
+  captureMode?: "side-channel" | "message_stop";
 }
 
 /**
@@ -153,14 +204,100 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     return;
   }
 
+  const toolBridge = input.toolBridge;
+  let toolBridgeDir: string | undefined;
+  let toolBridgeMcpConfigPath: string | undefined;
+  let appendSystemPromptPath: string | undefined;
+  let captureNonce: string | undefined;
+  // The append-system-prompt temp file shares the bridge dir lifecycle when a bridge exists; on the
+  // no-tools fast path it gets its own dir so MCP setup stays opt-in. Both are 0600 and reaped.
+  let systemPromptDir: string | undefined;
+  if (toolBridge) {
+    if (toolBridge.tools.length === 0 || toolBridge.emittedNameMap.size === 0) {
+      emit({ type: "error", message: "Coding-agent tool bridge was supplied without any isolated tools.", status: 500, errorType: "server_error", code: "tool_bridge_empty", retryable: false });
+      return;
+    }
+    captureNonce = randomUUID();
+    try {
+      toolBridgeDir = await mkdtemp(join(tmpdir(), "ocx-coding-agent-tools-"));
+      const catalogPath = join(toolBridgeDir, "catalog.json");
+      toolBridgeMcpConfigPath = join(toolBridgeDir, "mcp.json");
+      await writeFile(catalogPath, JSON.stringify(toolBridge.tools), { encoding: "utf8", mode: 0o600 });
+      await writeFile(
+        toolBridgeMcpConfigPath,
+        JSON.stringify({
+          mcpServers: {
+            [toolBridge.serverName]: {
+              type: "stdio",
+              command: process.execPath,
+              args: [toolBridge.serverModulePath, catalogPath],
+              env: {
+                ...(toolBridge.captureMode === "side-channel"
+                  ? { OCX_MCP_CAPTURE_DIR: toolBridgeDir, OCX_MCP_CAPTURE_NONCE: captureNonce }
+                  : {}),
+              },
+              defer_loading: false,
+              alwaysLoad: true,
+            },
+          },
+        }),
+        { encoding: "utf8", mode: 0o600 },
+      );
+      if (input.appendSystemPrompt) {
+        appendSystemPromptPath = join(toolBridgeDir, "system-prompt.txt");
+        await writeFile(appendSystemPromptPath, input.appendSystemPrompt, { encoding: "utf8", mode: 0o600 });
+      }
+    } catch (err) {
+      emit({
+        type: "error",
+        message: `Failed to prepare the coding-agent tool bridge: ${err instanceof Error ? err.message : String(err)}`,
+        status: 500,
+        errorType: "server_error",
+        code: "tool_bridge_setup_failed",
+        retryable: false,
+      });
+      if (toolBridgeDir) await rm(toolBridgeDir, { recursive: true, force: true }).catch(() => undefined);
+      if (systemPromptDir) await rm(systemPromptDir, { recursive: true, force: true }).catch(() => undefined);
+      return;
+    }
+  } else if (input.appendSystemPrompt) {
+    try {
+      systemPromptDir = await mkdtemp(join(tmpdir(), "ocx-system-prompt-"));
+      appendSystemPromptPath = join(systemPromptDir, "system-prompt.txt");
+      await writeFile(appendSystemPromptPath, input.appendSystemPrompt, { encoding: "utf8", mode: 0o600 });
+    } catch (err) {
+      emit({
+        type: "error",
+        message: `Failed to prepare the system prompt file: ${err instanceof Error ? err.message : String(err)}`,
+        status: 500,
+        errorType: "server_error",
+        code: "system_prompt_setup_failed",
+        retryable: false,
+      });
+      if (systemPromptDir) await rm(systemPromptDir, { recursive: true, force: true }).catch(() => undefined);
+      return;
+    }
+  }
+
   const args = buildArgs(profile, parsed, provider);
+  if (appendSystemPromptPath) {
+    args.push("--append-system-prompt-file", appendSystemPromptPath);
+  }
+  if (toolBridge && toolBridgeMcpConfigPath) {
+    // Exact names close the wildcard domain; --strict-mcp-config (family args) keeps user
+    // servers out, so the capture server is the only capability this turn can reach.
+    const flag = toolBridge.allowedToolsFlag ?? "--allowedTools";
+    args.push(flag, [...toolBridge.emittedNameMap.keys()].join(","), "--mcp-config", toolBridgeMcpConfigPath);
+  }
   const env = buildEnv(profile, apiKey);
   const invocation = commandInvocation(binary, args, platform, { env });
 
   let child: ChildProcess;
+  const effectiveCwd = input.deps.cwd ?? process.cwd();
   try {
     child = spawnFn(invocation.file, invocation.args, {
       ...invocation.options,
+      cwd: effectiveCwd,
       env,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
@@ -174,6 +311,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
       code: "cli_spawn_failed",
       retryable: false,
     });
+    // A synchronous spawn() throw skips the event-loop `finally` below, so the private
+    // bridge dir would leak unless it is removed here as well.
+    if (toolBridgeDir) await rm(toolBridgeDir, { recursive: true, force: true }).catch(() => undefined);
+    if (systemPromptDir) await rm(systemPromptDir, { recursive: true, force: true }).catch(() => undefined);
     return;
   }
 
@@ -218,6 +359,9 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
         return;
       } catch { /* fall back to terminating the direct child */ }
     }
+    // The capture-only MCP server is the CLI's child. Its stdin closes when the CLI dies, and
+    // mcp-server.ts exits on stdin EOF, so this ladder reaps the whole tree without knowing
+    // the grandchild pid. On win32 the tree kill above already reaches it via /T.
     try { child.kill("SIGTERM"); } catch { /* already gone */ }
     killTimer = setTimeout(() => {
       try { child.kill("SIGKILL"); } catch { /* already gone */ }
@@ -243,8 +387,26 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     if (stderrChunks.join("").length < MAX_STDERR_BYTES) stderrChunks.push(chunk);
   });
 
+  let watcher: FSWatcher | undefined;
+  let sideChannelPollTimer: ReturnType<typeof setInterval> | undefined;
+  const stopSideChannel = (): void => {
+    if (watcher) {
+      try {
+        watcher.close();
+      } catch {
+        /* ignore */
+      }
+      watcher = undefined;
+    }
+    if (sideChannelPollTimer) {
+      clearInterval(sideChannelPollTimer);
+      sideChannelPollTimer = undefined;
+    }
+  };
+
   const cleanup = (): void => {
     clearTimeout(timeoutTimer);
+    stopSideChannel();
     incoming.abortSignal?.removeEventListener("abort", onAbort);
     try { child.stdin?.destroy(); } catch { /* ignore */ }
     // Termination is owned by the reap step below, not here: killing in cleanup would set
@@ -253,6 +415,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
 
   let streamProtocolError: string | undefined;
   let turnError: string | undefined;
+  const captureCommitted = false;
   const state: StreamParseState = {
     sawPartialText: false,
     sawPartialThinking: false,
@@ -261,7 +424,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   };
 
   try {
-    // Write the replayed conversation, then close stdin so a single-shot turn can complete.
+    // Write the replayed conversation or incremental continuation, then close stdin so a single-shot turn can complete.
     const stdin = child.stdin;
     if (stdin) {
       stdin.on("error", () => { /* EPIPE if the CLI exits early; surfaced via close/stderr */ });
@@ -272,18 +435,274 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
       const historyCharLimit = projectedHistoryCharLimit(
         modelRecordValue(provider.modelContextWindows, parsed.modelId) ?? provider.contextWindow,
       );
-      for (const line of buildConversationInput(parsed, { maxHistoryChars: historyCharLimit })) stdin.write(`${line}\n`);
+      const lines = input.buildInputLines ? input.buildInputLines(parsed) : buildConversationInput(parsed, { maxHistoryChars: historyCharLimit });
+      for (const line of lines) stdin.write(`${line}\n`);
       stdin.end();
     }
     const stdout = child.stdout;
     if (!stdout) throw new CodingAgentProtocolError(`${profile.label} CLI produced no stdout stream`);
+    let sideChannelCaptured = false;
+    let captureCommitted = false;
+    let seenCaptureSequence = 0;
+    const checkSideChannel = async (): Promise<void> => {
+      if (sideChannelCaptured || captureCommitted || terminalEmitted || incoming.abortSignal?.aborted || !toolBridge || !toolBridgeDir) return;
+      try {
+        const files = await readdir(toolBridgeDir);
+        const captureFiles = files.filter(f => f.startsWith("capture-") && f.endsWith(".json")).sort();
+        for (const file of captureFiles) {
+          if (sideChannelCaptured || captureCommitted || terminalEmitted || incoming.abortSignal?.aborted) break;
+          const filePath = join(toolBridgeDir, file);
+          let content: string;
+          try {
+            content = await readFile(filePath, "utf8");
+          } catch {
+            continue;
+          }
+          if (Buffer.byteLength(content, "utf8") > MAX_CAPTURE_BYTES) {
+            sideChannelCaptured = true;
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: "MCP capture record exceeds byte limit.", status: 502, errorType: "upstream_error", code: "tool_call_limit", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
+          let payload: ToolBridgeCapturePayload;
+          try {
+            payload = JSON.parse(content);
+          } catch {
+            sideChannelCaptured = true;
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: "Malformed MCP capture record.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
+          if (payload.version !== 1 || payload.nonce !== captureNonce) {
+            sideChannelCaptured = true;
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: "MCP capture nonce mismatch.", status: 502, errorType: "upstream_error", code: "tool_bridge_init_mismatch", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
+          if (
+            typeof payload.sequence !== "number" ||
+            !Number.isSafeInteger(payload.sequence) ||
+            payload.sequence !== 1 ||
+            file !== `capture-${payload.sequence}.json` ||
+            seenCaptureSequence !== 0
+          ) {
+            sideChannelCaptured = true;
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: "Invalid MCP capture sequence.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
+          seenCaptureSequence = payload.sequence;
+          if (payload.arguments === null || typeof payload.arguments !== "object" || Array.isArray(payload.arguments)) {
+            sideChannelCaptured = true;
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: "MCP capture record has invalid arguments.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
+          const wireName = toolBridge.emittedNameMap.get(payload.name)
+            ?? (toolBridge.serverName
+              ? toolBridge.emittedNameMap.get(`mcp__${toolBridge.serverName}__${payload.name}`)
+              : undefined);
+          if (wireName === undefined) {
+            sideChannelCaptured = true;
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: "Coding-agent CLI called a tool outside the isolated catalog.", status: 502, errorType: "upstream_error", code: "undeclared_tool_call", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
+          const choice = parsed.options.toolChoice;
+          if (choice === "none") {
+            sideChannelCaptured = true;
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: "Coding-agent CLI called a tool when tool_choice is none.", status: 502, errorType: "upstream_error", code: "undeclared_tool_call", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
+          const allTools = parsed.context.tools ?? [];
+          const predicate = toolChoiceToolPredicate(choice, allTools);
+          const matchingTool = allTools.find(t => (t.namespace ? `${t.namespace}.${t.name}` : t.name) === wireName);
+          if (!matchingTool || !predicate(matchingTool)) {
+            sideChannelCaptured = true;
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: `Tool ${wireName} was called but tool_choice disallowed it.`, status: 502, errorType: "upstream_error", code: "tool_call_required", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
+          const advertisedTool = toolBridge.tools.find(t =>
+            t.name === payload.name ||
+            (toolBridge.serverName && `mcp__${toolBridge.serverName}__${t.name}` === payload.name) ||
+            `mcp__opencodex__${t.name}` === payload.name,
+          );
+          if (!advertisedTool) {
+            sideChannelCaptured = true;
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: "Coding-agent CLI called a tool outside the isolated catalog.", status: 502, errorType: "upstream_error", code: "undeclared_tool_call", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
+          let validationError: string | undefined;
+          try {
+            const validator = toolArgumentSchemaValidator.getValidator(advertisedTool.inputSchema as JsonSchemaType);
+            const validation = validator(payload.arguments);
+            if (!validation.valid) {
+              validationError = validation.errorMessage ?? "schema validation failed";
+            }
+          } catch (err) {
+            validationError = err instanceof Error ? err.message : "schema compilation failed";
+          }
+          if (validationError) {
+            sideChannelCaptured = true;
+            captureCommitted = true;
+            stopSideChannel();
+            emitOnce({ type: "error", message: `MCP tool arguments failed schema validation: ${validationError}`, status: 502, errorType: "upstream_error", code: "invalid_tool_arguments", retryable: false });
+            kill();
+            stopStream();
+            break;
+          }
+          sideChannelCaptured = true;
+          captureCommitted = true;
+          stopSideChannel();
+          const clientCallId = state.openToolCallId ?? `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+          emitOnce({ type: "tool_call_start", id: clientCallId, name: wireName });
+          emitOnce({ type: "tool_call_delta", arguments: JSON.stringify(payload.arguments) });
+          emitOnce({ type: "tool_call_end" });
+          emitOnce({ type: "done", stopReason: "tool_use", endTurn: false });
+          kill();
+          stopStream();
+          break;
+        }
+      } catch {
+        /* ignore readdir errors during teardown */
+      }
+    };
+    if (toolBridge && toolBridge.captureMode === "side-channel" && toolBridgeDir) {
+      const dir = toolBridgeDir;
+      try {
+        watcher = watch(dir, () => {
+          void checkSideChannel();
+        });
+      } catch {
+        /* fallback to polling if watch fails */
+      }
+      sideChannelPollTimer = setInterval(() => {
+        void checkSideChannel();
+      }, 50);
+    }
     try {
+      let initValidated = false;
+      let toolCallStarts = 0;
+      let failClosed = false;
       for await (const message of readJsonLines(stdout)) {
         if (incoming.abortSignal?.aborted) break;
+        if (toolBridge) {
+          const initError = toolBridgeInitError(message, toolBridge.serverName);
+          if (initError) {
+            emitOnce({ type: "error", message: initError, status: 502, errorType: "upstream_error", code: "tool_bridge_init_mismatch", retryable: false });
+            kill();
+            break;
+          }
+          if (message.type === "system" && message.subtype === "init") initValidated = true;
+        }
         for (const event of mapStreamMessageToEvents(message, state)) {
+          if (captureCommitted || sideChannelCaptured) break;
+          if (toolBridge && event.type === "tool_call_start") {
+            toolCallStarts += 1;
+            if (toolCallStarts > toolBridge.maxTurnToolCalls) {
+              emitOnce({ type: "error", message: `Coding-agent CLI returned more than the ${toolBridge.maxTurnToolCalls}-tool-call turn limit.`, status: 502, errorType: "upstream_error", code: "tool_call_limit", retryable: false });
+              failClosed = true;
+              kill();
+              break;
+            }
+            const wireName = toolBridge.emittedNameMap.get(event.name);
+            if (wireName === undefined) {
+              emitOnce({ type: "error", message: "Coding-agent CLI called a tool outside the isolated catalog.", status: 502, errorType: "upstream_error", code: "undeclared_tool_call", retryable: false });
+              failClosed = true;
+              kill();
+              break;
+            }
+            emitOnce({ ...event, name: wireName });
+            continue;
+          }
+          if (
+            toolBridge?.requireToolCall === true &&
+            !terminalEmitted &&
+            event.type === "done" &&
+            event.stopReason !== "tool_use" &&
+            (state.completedToolCalls ?? 0) === 0
+          ) {
+            // `tool_choice: required|named` on a bridge turn: a text-only terminal result must not
+            // become a successful completion the client can accept. The capture-only bridge has no
+            // way to force the nested CLI, so fail closed with the same stable error shape the
+            // other bridge contract violations use.
+            emitOnce({ type: "error", message: "CodeBuddy finished without calling the required tool.", status: 502, errorType: "upstream_error", code: "tool_call_required", retryable: false });
+            failClosed = true;
+            kill();
+            break;
+          }
           emitOnce(event.type === "error"
             ? { ...event, message: redactSecrets(event.message, profile.tokenEnv, apiKey) }
             : event);
+        }
+        if (failClosed) break;
+        if (
+          toolBridge &&
+          !terminalEmitted &&
+          state.sawMessageStop &&
+          toolCallStarts > 0 &&
+          (state.completedToolCalls ?? 0) !== toolCallStarts
+        ) {
+          if (!captureCommitted) {
+            emitOnce({ type: "error", message: "Coding-agent CLI ended with an incomplete tool call.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
+            kill();
+            break;
+          }
+        }
+        if (
+          toolBridge &&
+          !terminalEmitted &&
+          state.sawMessageStop &&
+          (state.completedToolCalls ?? 0) > 0
+        ) {
+          if (!initValidated) {
+            emitOnce({ type: "error", message: "Coding-agent tool bridge init frame was not observed before the first tool call.", status: 502, errorType: "upstream_error", code: "tool_bridge_init_missing", retryable: false });
+            kill();
+            break;
+          }
+          // The capture-only MCP handler never answers, so the CLI parks after message_stop.
+          // The completed tool_use blocks are this turn's structured output: end the leg here
+          // and terminate the tree; the client executes, and the next request continues.
+          // Pre-result usage snapshots keep this terminated leg accountable: no result frame
+          // ever arrives for a turn parked on the never-answering capture server.
+          emitOnce({
+            type: "done",
+            stopReason: "tool_use",
+            endTurn: false,
+            ...(state.partialUsage ? { usage: state.partialUsage } : {}),
+          });
+          kill();
+          break;
         }
         if (terminalEmitted) break;
       }
@@ -296,6 +715,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     turnError = err instanceof Error ? err.message : String(err);
   } finally {
     cleanup();
+    if (toolBridgeDir) {
+      await rm(toolBridgeDir, { recursive: true, force: true }).catch(() => undefined);
+      if (systemPromptDir) await rm(systemPromptDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   // Reap the process so no zombie is left behind (§三十): wait for the real `close`, and
@@ -312,7 +735,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   if (reapTimer) clearTimeout(reapTimer);
   if (killTimer) clearTimeout(killTimer);
 
-  if (!terminalEmitted) {
+  if (!terminalEmitted && !captureCommitted) {
     const stderr = redactSecrets(boundedStderr(stderrChunks), profile.tokenEnv, apiKey);
     if (incoming.abortSignal?.aborted) {
       emitOnce({ type: "error", message: `${profile.label} turn was aborted.`, retryable: false });

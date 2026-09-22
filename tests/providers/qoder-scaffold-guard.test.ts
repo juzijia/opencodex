@@ -156,6 +156,13 @@ describe("QoderScaffoldFilter", () => {
     expect(filter.push("more vendor narration")).toEqual({ text: "", fail: null });
     expect(filter.flush()).toEqual({ text: "", fail: null });
   });
+
+
+  test("refuses a bare <tool_call prefix that ends at a token boundary", () => {
+    // A truncated tag at the buffer end still trips the guard; the next delta may complete it.
+    const filter = new QoderScaffoldFilter();
+    expect(filter.push("leak <tool_call").fail).toContain("<tool_call");
+  });
 });
 
 describe("guardQoderScaffolding", () => {
@@ -228,5 +235,17 @@ describe("guardQoderScaffolding", () => {
     guarded({ type: "tool_call_start", id: "call_1", name: "exec" });
     guarded({ type: "done", stopReason: "stop" });
     expect(events.map(event => event.type)).toEqual(["tool_call_start", "done"]);
+  });
+  test("refuses the turn when <tool_call> or <function= markup leaks into text channel", () => {
+    const { events, emit } = collect();
+    const guarded = guardQoderScaffolding(emit);
+    guarded({ type: "text_delta", text: "<tool_call>\n<function=Bash>\n<parameter=command>echo hello</parameter>\n</function>\n</tool_call>" });
+    guarded({ type: "done", stopReason: "stop" });
+    const terminal = events[events.length - 1]!;
+    expect(terminal.type).toBe("error");
+    if (terminal.type !== "error") throw new Error("expected an error terminal");
+    expect(terminal.code).toBe(QODER_SCAFFOLD_ERROR_CODE);
+    expect(terminal.status).toBe(502);
+    expect(events.filter(event => event.type === "tool_call_start")).toHaveLength(0);
   });
 });

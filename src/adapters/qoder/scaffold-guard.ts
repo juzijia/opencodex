@@ -36,10 +36,20 @@ const REMINDER_CLOSE = "</system-reminder>";
  * text is not possible. A stray `</system-reminder>` with no opener is in the same class:
  * the block it belonged to was already partly forwarded, or never existed.
  */
-const UNREPAIRABLE_MARKERS = ["<functions.", "<invoke name=", "<invoke>", "</invoke>", REMINDER_CLOSE] as const;
+const UNREPAIRABLE_MARKERS = [
+  "<functions.",
+  "<function=",
+  "<tool_call>",
+  "<tool_call",
+  "</tool_call>",
+  "<invoke name=",
+  "<invoke>",
+  "</invoke>",
+  REMINDER_CLOSE,
+] as const;
 
 /** Markers that end a block rather than start one; their prefix is never an answer. */
-const CLOSING_MARKERS = new Set<string>(["</invoke>", REMINDER_CLOSE]);
+const CLOSING_MARKERS = new Set<string>(["</invoke>", "</tool_call>", REMINDER_CLOSE]);
 
 /** Every marker the scanner must be able to recognize mid-split. */
 const ALL_MARKERS = [REMINDER_OPEN, ...UNREPAIRABLE_MARKERS] as const;

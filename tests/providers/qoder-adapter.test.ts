@@ -40,6 +40,7 @@ describe("qoder adapter", () => {
     expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
     expect(args).toContain("--strict-mcp-config");
     expect(args).toContain("--no-session-persistence");
+    expect(args).not.toContain("--max-turns");
     expect(args[args.indexOf("--reasoning-effort") + 1]).toBe("high");
     expect(args).not.toContain("--dangerously-skip-permissions");
   });
