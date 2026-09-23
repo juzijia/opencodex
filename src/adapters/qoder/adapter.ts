@@ -2,8 +2,8 @@ import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig, OcxUsage } from
 import { fileURLToPath } from "node:url";
 import { estimateTokens } from "../../lib/token-estimate";
 import type { AdapterRequest, ProviderAdapter } from "../base";
-import { mapReasoningEffort } from "../../reasoning-effort";
-import { buildConversationInput, buildSystemPrompt } from "../coding-agent/protocol";
+import { mapReasoningEffort, modelRecordValue } from "../../reasoning-effort";
+import { buildConversationInput, buildSystemPrompt, projectedHistoryCharLimit } from "../coding-agent/protocol";
 import {
   baseScopedEnv,
   runCodingAgentTurn,
@@ -26,28 +26,9 @@ export const QODER_MCP_SERVER_NAME = CODEBUDDY_MCP_SERVER_NAME;
 const QODER_MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.ts", import.meta.url));
 
 const TOOL_BRIDGE_SYSTEM_PROMPT = [
-  "Tool contract for this turn:",
-  "",
-  "The isolated tool catalog shown for this turn is available and is the complete Codex Responses-compatible tool-call surface.",
-  "Call only a listed tool using its listed argument schema; do not invent, translate, or rename tool names.",
-  "",
-  "If you need shell, file search, file read, edit, or discovery behavior, call the listed tool that provides that capability instead of claiming that the capability is unavailable.",
-  "",
-  "OpenCodex captures the tool intent.",
-  "The host client performs approval, sandboxing, and execution under the Codex tool contract and returns the authoritative tool result.",
-  "",
-  "A tool call is complete only after its tool result is returned.",
-  "Do not claim that a command ran, a file was inspected, or the workspace changed before that result arrives.",
-  "After receiving a successful tool result, use it normally and continue the task.",
-  "",
-  "Issue at most one tool call in this invocation.",
-  "If more tool work is needed, continue after the result is returned in the next invocation.",
-  "",
-  "Treat tool-call and tool-result records already present in the conversation as completed history.",
-  "Use their returned results, and do not replay a historical call merely because this is a new invocation.",
-  "",
-  "The isolated catalog is the only tool surface for this turn.",
-  "Native Qoder tools and unrelated user-configured MCP servers are unavailable unless listed there.",
+  "Use only the tools advertised for this turn and their declared schemas.",
+  "Emit at most one tool call per invocation. The host authorizes and executes it and returns its result in a continuation.",
+  "Claim execution only after the matching result arrives. Use prior completed call/result pairs as history; do not replay them merely because this is a new invocation.",
 ].join("\n");
 
 export function buildQoderChildEnv(profile: QoderProfile, apiKey: string): Record<string, string> {
@@ -57,8 +38,8 @@ export function buildQoderChildEnv(profile: QoderProfile, apiKey: string): Recor
 /**
  * Qoder CLI invocation; Codex remains the tool owner.
  *
- * `--max-turns` stays absent: a bridged leg is terminated by the parent at `message_stop`, and the
- * CLI's own single-turn cap would cut off the multi-tool continuation the bridge relies on.
+ * A bridged leg is terminated by the parent at message_stop; the no-tools path keeps its
+ * original single-turn cap.
  */
 export function buildQoderArgs(
   parsed: OcxParsedRequest,
@@ -75,6 +56,7 @@ export function buildQoderArgs(
     "--no-session-persistence",
     "--model", parsed.modelId,
   ];
+  if (!toolBridge?.tools.length) args.push("--max-turns", "1");
   const effort = mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning);
   if (effort) args.push("--reasoning-effort", effort);
   return args;
@@ -234,6 +216,7 @@ export function extractConversationSemanticText(lines: readonly string[]): strin
 export function estimateQoderVisibleInputTokens(
   parsed: OcxParsedRequest,
   toolBridge?: Pick<CodeBuddyToolBridge, "tools">,
+  provider?: OcxProviderConfig,
 ): number {
   const parts: string[] = [];
 
@@ -243,7 +226,10 @@ export function estimateQoderVisibleInputTokens(
   if (toolBridge && toolBridge.tools.length > 0) parts.push(TOOL_BRIDGE_SYSTEM_PROMPT);
 
   // 2. Projected conversation semantic text (inherits history formatting and truncation)
-  const conversationText = extractConversationSemanticText(buildConversationInput(parsed));
+  const historyCharLimit = projectedHistoryCharLimit(
+    provider ? modelRecordValue(provider.modelContextWindows, parsed.modelId) ?? provider.contextWindow : undefined,
+  );
+  const conversationText = extractConversationSemanticText(buildConversationInput(parsed, { maxHistoryChars: historyCharLimit }));
   if (conversationText) parts.push(conversationText);
 
   // 3. Advertised MCP tools
@@ -332,13 +318,21 @@ export function wrapQoderEstimatedUsage(
       }
 
       const estimatedOutputTokens = thinkingTokens + textTokens + toolTokens;
-      const totalTokens = estimatedInputTokens + estimatedOutputTokens;
+      const observed = event.usage;
+      const inputTokens = observed?.estimated && (observed.inputTokens ?? 0) > 0
+        ? observed.inputTokens! : estimatedInputTokens;
+      const outputTokens = observed?.estimated
+        ? Math.max(observed.outputTokens ?? 0, estimatedOutputTokens)
+        : estimatedOutputTokens;
 
       const usage: OcxUsage = {
-        inputTokens: estimatedInputTokens,
-        outputTokens: estimatedOutputTokens,
-        totalTokens,
+        inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
         estimated: true,
+        ...(observed?.estimated && (observed.cachedInputTokens ?? 0) > 0 ? { cachedInputTokens: observed.cachedInputTokens } : {}),
+        ...(observed?.estimated && (observed.cacheReadInputTokens ?? 0) > 0 ? { cacheReadInputTokens: observed.cacheReadInputTokens } : {}),
+        ...(observed?.estimated && (observed.cacheCreationInputTokens ?? 0) > 0 ? { cacheCreationInputTokens: observed.cacheCreationInputTokens } : {}),
       };
 
       emit({ ...event, usage });
@@ -347,7 +341,9 @@ export function wrapQoderEstimatedUsage(
 
     if (event.type === "error") {
       if (event.usage) {
-        if (isPositiveAuthoritativeUsage(event.usage)) {
+        if (event.usage.estimated === true) {
+          emit(event);
+        } else if (isPositiveAuthoritativeUsage(event.usage)) {
           emit({ ...event, usage: cleanAuthoritativeUsage(event.usage) });
         } else {
           const { usage: _, ...rest } = event;
@@ -407,6 +403,7 @@ export function createQoderAdapter(provider: OcxProviderConfig, deps: QoderAdapt
               serverModulePath: QODER_MCP_SERVER_PATH,
               tools: toolBridge.tools,
               emittedNameMap: toolBridge.emittedNameMap,
+              validateArguments: toolBridge.validateArguments,
               maxTurnToolCalls: CODEBUDDY_TOOL_LIMITS.maxTurnToolCalls,
               requireToolCall: toolBridge.requireToolCall,
               allowedToolsFlag: "--allowed-tools",
@@ -416,6 +413,7 @@ export function createQoderAdapter(provider: OcxProviderConfig, deps: QoderAdapt
       const estimatedInputTokens = estimateQoderVisibleInputTokens(
         parsed,
         toolBridge.tools.length > 0 ? toolBridge : undefined,
+        provider,
       );
       const usageTrackingEmit = wrapQoderEstimatedUsage(emit, estimatedInputTokens, parsed.modelId);
       const appendSystemPrompt = buildQoderAppendSystemPrompt(

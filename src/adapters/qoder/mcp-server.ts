@@ -221,13 +221,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       name: request.params.name,
       arguments: (request.params.arguments as Record<string, unknown>) ?? {},
     };
-    const payloadBytes = Buffer.from(JSON.stringify(payload), "utf8");
-    if (payloadBytes.byteLength <= MAX_CAPTURE_BYTES) {
-      const targetFile = join(captureDir, `capture-${callSequence}.json`);
-      const tmpFile = join(captureDir, `.${callSequence}.${randomUUID()}.tmp`);
-      await writeFile(tmpFile, payloadBytes, { encoding: "utf8", mode: 0o600 });
-      await rename(tmpFile, targetFile);
+    let payloadBytes = Buffer.from(JSON.stringify(payload), "utf8");
+    if (payloadBytes.byteLength > MAX_CAPTURE_BYTES) {
+      payloadBytes = Buffer.from(JSON.stringify({ ...payload, arguments: {}, error: "tool_call_limit" }), "utf8");
     }
+    const targetFile = join(captureDir, `capture-${callSequence}.json`);
+    const tmpFile = join(captureDir, `.${callSequence}.${randomUUID()}.tmp`);
+    await writeFile(tmpFile, payloadBytes, { mode: 0o600 });
+    await rename(tmpFile, targetFile);
   }
   // A pending Promise does not execute anything and keeps the vendor turn
   // parked until the parent has captured the call and terminates the tree.

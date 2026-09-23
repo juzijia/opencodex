@@ -492,3 +492,283 @@ describe("Qoder tool catalog limits", () => {
     );
   });
 });
+
+
+describe("Qoder argument validation dialect isolation", () => {
+  test("validates arguments through request-local compiled schemas", () => {
+    const bridge = buildQoderToolBridge(
+      parsed([
+        tool("sum", {
+          parameters: {
+            type: "object",
+            properties: { a: { type: "integer" }, b: { type: "integer" } },
+            required: ["a", "b"],
+          },
+        }),
+      ]),
+    );
+    expect(bridge.validateArguments("sum", { a: 1, b: 2 })).toBeUndefined();
+    expect(bridge.validateArguments("sum", { a: 1 })).toMatch(/required/);
+    expect(bridge.validateArguments("sum", { a: "x", b: 2 })).toMatch(
+      /integer/,
+    );
+    expect(bridge.validateArguments("missing", {})).toMatch(
+      /Unknown tool: missing/,
+    );
+  });
+
+  test("fails closed on the empty none bridge", () => {
+    const bridge = buildQoderToolBridge(parsed([tool("sum")], "none"));
+    expect(bridge.tools).toEqual([]);
+    expect(bridge.validateArguments("sum", {})).toMatch(
+      /no tools are advertised/,
+    );
+  });
+
+  test("does not bleed schemas sharing one $id across requests (F02)", () => {
+    const strict = buildQoderToolBridge(
+      parsed([
+        tool("shared", {
+          parameters: {
+            $id: "https://example.com/turn-a",
+            type: "object",
+            properties: { v: { type: "integer" } },
+            required: ["v"],
+          },
+        }),
+      ]),
+    );
+    const relaxed = buildQoderToolBridge(
+      parsed([
+        tool("shared", {
+          parameters: {
+            $id: "https://example.com/turn-a",
+            type: "object",
+            properties: { v: { type: "integer", minimum: 10 } },
+          },
+        }),
+      ]),
+    );
+    expect(strict.validateArguments("shared", { v: 5 })).toBeUndefined();
+    expect(strict.validateArguments("shared", {})).toMatch(/required/);
+    expect(relaxed.validateArguments("shared", { v: 5 })).toMatch(/>= 10/);
+    expect(relaxed.validateArguments("shared", { v: 15 })).toBeUndefined();
+    expect(relaxed.validateArguments("shared", {})).toBeUndefined();
+  });
+
+  test("compiles distinct tools sharing one $id within a request (F02)", () => {
+    const bridge = buildQoderToolBridge(
+      parsed([
+        tool("dup_int", {
+          parameters: {
+            $id: "https://example.com/dup",
+            type: "object",
+            properties: { v: { type: "integer" } },
+            required: ["v"],
+          },
+        }),
+        tool("dup_str", {
+          parameters: {
+            $id: "https://example.com/dup",
+            type: "object",
+            properties: { v: { type: "string" } },
+          },
+        }),
+      ]),
+    );
+    expect(bridge.validateArguments("dup_int", { v: 1 })).toBeUndefined();
+    expect(bridge.validateArguments("dup_int", { v: "x" })).toMatch(/integer/);
+    expect(bridge.validateArguments("dup_str", { v: "x" })).toBeUndefined();
+    expect(bridge.validateArguments("dup_str", { v: 1 })).toMatch(/string/);
+  });
+
+  test("rejects async schemas before compilation (F03)", () => {
+    expect(() =>
+      buildQoderToolBridge(
+        parsed([
+          tool("async_root", { parameters: { $async: true, type: "object" } }),
+        ]),
+      ),
+    ).toThrow(/invalid input schema.*\$async/);
+    expect(() =>
+      buildQoderToolBridge(
+        parsed([
+          tool("async_nested", {
+            parameters: {
+              type: "object",
+              properties: { value: { $async: true } },
+            },
+          }),
+        ]),
+      ),
+    ).toThrow(/invalid input schema.*\$async/);
+    expect(() =>
+      buildQoderToolBridge(
+        parsed([
+          tool("async_false", {
+            parameters: { $async: false, type: "object" },
+          }),
+        ]),
+      ),
+    ).not.toThrow();
+  });
+
+  test("enforces dependentRequired under 2020-12 (F04)", () => {
+    const bridge = buildQoderToolBridge(
+      parsed([
+        tool("dep", {
+          parameters: {
+            $schema: "https://json-schema.org/draft/2020-12/schema",
+            type: "object",
+            properties: { a: { type: "string" }, b: { type: "string" } },
+            dependentRequired: { a: ["b"] },
+          },
+        }),
+      ]),
+    );
+    expect(bridge.validateArguments("dep", { a: "x" })).toMatch(/b/);
+    expect(bridge.validateArguments("dep", { a: "x", b: "y" })).toBeUndefined();
+  });
+
+  test("enforces prefixItems under 2020-12 (F04)", () => {
+    const bridge = buildQoderToolBridge(
+      parsed([
+        tool("prefix", {
+          parameters: {
+            $schema: "https://json-schema.org/draft/2020-12/schema",
+            type: "object",
+            properties: {
+              tags: {
+                type: "array",
+                prefixItems: [{ type: "string" }],
+                items: false,
+              },
+            },
+          },
+        }),
+      ]),
+    );
+    expect(bridge.validateArguments("prefix", { tags: ["ok"] })).toBeUndefined();
+    expect(bridge.validateArguments("prefix", { tags: [1] })).toMatch(/string/);
+  });
+
+  test("supports 2019-09 but rejects 2020-only keywords under it", () => {
+    const bridge = buildQoderToolBridge(
+      parsed([
+        tool("dep19", {
+          parameters: {
+            $schema: "https://json-schema.org/draft/2019-09/schema",
+            type: "object",
+            properties: { a: { type: "string" }, b: { type: "string" } },
+            dependentRequired: { a: ["b"] },
+          },
+        }),
+      ]),
+    );
+    expect(bridge.validateArguments("dep19", { a: "x" })).toMatch(/b/);
+    expect(
+      bridge.validateArguments("dep19", { a: "x", b: "y" }),
+    ).toBeUndefined();
+    expect(() =>
+      buildQoderToolBridge(
+        parsed([
+          tool("prefix19", {
+            parameters: {
+              $schema: "https://json-schema.org/draft/2019-09/schema",
+              type: "object",
+              properties: {
+                tags: { type: "array", prefixItems: [{ type: "string" }] },
+              },
+            },
+          }),
+        ]),
+      ),
+    ).toThrow(/prefixItems.*2020-12/);
+  });
+
+  test("rejects unsupported dialects instead of guessing (F04)", () => {
+    for (const uri of [
+      "http://json-schema.org/draft-06/schema",
+      "https://example.com/custom-schema",
+    ]) {
+      expect(() =>
+        buildQoderToolBridge(
+          parsed([
+            tool("bad_dialect", {
+              parameters: { $schema: uri, type: "object" },
+            }),
+          ]),
+        ),
+      ).toThrow(/unsupported JSON Schema dialect/);
+    }
+  });
+
+  test("rejects modern keywords when no dialect is declared (F04)", () => {
+    expect(() =>
+      buildQoderToolBridge(
+        parsed([
+          tool("modern_implicit", {
+            parameters: { type: "object", dependentRequired: { a: ["b"] } },
+          }),
+        ]),
+      ),
+    ).toThrow(/dependentRequired.*2019-09 or 2020-12/);
+    expect(() =>
+      buildQoderToolBridge(
+        parsed([
+          tool("prefix_implicit", {
+            parameters: {
+              type: "object",
+              properties: {
+                tags: { type: "array", prefixItems: [{ type: "string" }] },
+              },
+            },
+          }),
+        ]),
+      ),
+    ).toThrow(/prefixItems.*2020-12/);
+  });
+
+  test("does not mistake property names for modern keyword hits", () => {
+    const bridge = buildQoderToolBridge(
+      parsed([
+        tool("named_props", {
+          parameters: {
+            type: "object",
+            properties: {
+              dependentRequired: { type: "string" },
+              prefixItems: { type: "string" },
+            },
+          },
+        }),
+      ]),
+    );
+    expect(
+      bridge.validateArguments("named_props", {
+        dependentRequired: "x",
+        prefixItems: "y",
+      }),
+    ).toBeUndefined();
+    expect(
+      bridge.validateArguments("named_props", { dependentRequired: 1 }),
+    ).toMatch(/string/);
+  });
+
+  test("supports explicit draft-07 without regressions", () => {
+    const bridge = buildQoderToolBridge(
+      parsed([
+        tool("draft7", {
+          parameters: {
+            $schema: "https://json-schema.org/draft-07/schema",
+            type: "object",
+            properties: { v: { type: "integer", minimum: 10 } },
+            required: ["v"],
+          },
+        }),
+      ]),
+    );
+    expect(bridge.validateArguments("draft7", { v: 5 })).toMatch(/>= 10/);
+    expect(bridge.validateArguments("draft7", { v: 15 })).toBeUndefined();
+    expect(bridge.validateArguments("draft7", {})).toMatch(/required/);
+  });
+});

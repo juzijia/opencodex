@@ -10,7 +10,8 @@ import {
   cleanAuthoritativeUsage,
   wrapQoderEstimatedUsage,
 } from "../../src/adapters/qoder/adapter";
-import { buildConversationInput } from "../../src/adapters/coding-agent/protocol";
+import { buildConversationInput, projectedHistoryCharLimit } from "../../src/adapters/coding-agent/protocol";
+import { estimateTokens } from "../../src/lib/token-estimate";
 import {
   clearQoderBinaryCache,
   QODER_GLOBAL_PROFILE,
@@ -389,6 +390,13 @@ describe("Qoder estimated usage", () => {
     expect(estA).toBeGreaterThan(50000);
     expect(estB).toBeGreaterThan(50000);
     expect(estA).toBe(estB);
+
+    const wideProvider = testProvider({ contextWindow: 1_000_000 });
+    const sentText = extractConversationSemanticText(buildConversationInput(reqA, {
+      maxHistoryChars: projectedHistoryCharLimit(wideProvider.contextWindow),
+    }));
+    expect(estimateQoderVisibleInputTokens(reqA, undefined, wideProvider)).toBe(estimateTokens(sentText, reqA.modelId));
+    expect(estimateQoderVisibleInputTokens(reqA, undefined, wideProvider)).toBeGreaterThan(estA);
   });
 
 });

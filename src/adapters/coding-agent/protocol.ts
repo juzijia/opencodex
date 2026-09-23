@@ -225,6 +225,8 @@ export interface ToolBridgeCapturePayload {
   sequence: number;
   name: string;
   arguments: Record<string, unknown>;
+  /** Bounded helper failure; no oversized argument content is copied into the record. */
+  error?: "tool_call_limit";
 }
 
 /**

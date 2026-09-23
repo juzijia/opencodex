@@ -69,6 +69,11 @@ function reminderOpensHere(lowered: string, at: number): boolean {
   return after === undefined || /[\s/>]/.test(after);
 }
 
+function toolCallOpensHere(lowered: string, at: number): boolean {
+  const after = lowered[at + "<tool_call".length];
+  return after !== undefined && /[\s/>]/.test(after);
+}
+
 /**
  * Ceiling on a suppressed block before it is treated as unterminated.
  *
@@ -92,7 +97,7 @@ function heldSuffixLength(text: string): number {
   for (let length = limit; length > 0; length--) {
     const suffix = text.slice(text.length - length).toLowerCase();
     for (const marker of ALL_MARKERS) {
-      if (marker.length > length && marker.startsWith(suffix)) return length;
+      if ((marker.length > length || (marker === "<tool_call" && marker.length === length)) && marker.startsWith(suffix)) return length;
     }
   }
   return 0;
@@ -175,6 +180,9 @@ export class QoderScaffoldFilter {
         while (at >= 0 && marker === REMINDER_OPEN && !reminderOpensHere(lowered, at)) {
           at = lowered.indexOf(marker, at + 1);
         }
+        while (at >= 0 && marker === "<tool_call" && !toolCallOpensHere(lowered, at)) {
+          at = lowered.indexOf(marker, at + 1);
+        }
         if (at < 0) continue;
         // A closer sitting exactly where an opener starts cannot happen, so ties are impossible.
         if (earliest < 0 || at < earliest) {
@@ -217,6 +225,7 @@ export class QoderScaffoldFilter {
     if (this.mode === "suppress") return this.fail("", `an unterminated ${REMINDER_OPEN}> block`);
     const text = this.pending;
     this.pending = "";
+    if (text.toLowerCase() === "<tool_call") return this.fail("", "vendor tool-call markup (<tool_call)");
     return { text, fail: null };
   }
 

@@ -1,7 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CODEBUDDY_TOOL_LIMITS } from "../../src/adapters/qoder/tool-bridge";
@@ -53,6 +53,33 @@ afterEach(() => {
 });
 
 describe("Qoder capture-only MCP server", () => {
+  test("reports oversized arguments through a bounded capture error", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "opencodex-qoder-mcp-limit-"));
+    tempDirs.push(dir);
+    const catalogPath = join(dir, "tools.json");
+    writeFileSync(catalogPath, JSON.stringify([definition("lookup")]));
+    const client = new Client({ name: "qoder-limit-test", version: "1" });
+    const transport = new StdioClientTransport({
+      command: process.execPath, args: [serverPath, catalogPath], stderr: "pipe",
+      env: { OCX_MCP_CAPTURE_DIR: dir, OCX_MCP_CAPTURE_NONCE: "test-nonce" },
+    });
+    const abort = new AbortController();
+    try {
+      await client.connect(transport);
+      const pending = client.callTool({ name: "lookup", arguments: { value: "x".repeat(256 * 1024) } }, undefined, { signal: abort.signal });
+      void pending.catch(() => {});
+      const capture = join(dir, "capture-1.json");
+      for (let i = 0; i < 100 && !existsSync(capture); i++) await Bun.sleep(5);
+      expect(existsSync(capture)).toBe(true);
+      const content = readFileSync(capture, "utf8");
+      expect(content.length).toBeLessThan(1024);
+      expect(JSON.parse(content)).toMatchObject({ version: 1, nonce: "test-nonce", error: "tool_call_limit" });
+    } finally {
+      abort.abort();
+      await client.close();
+    }
+  });
+
   test("advertises only the private catalog, rejects unknown tools, and never executes known tools", async () => {
     const dir = mkdtempSync(join(tmpdir(), "opencodex-qoder-mcp-test-"));
     tempDirs.push(dir);

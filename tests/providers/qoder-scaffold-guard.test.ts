@@ -159,9 +159,19 @@ describe("QoderScaffoldFilter", () => {
 
 
   test("refuses a bare <tool_call prefix that ends at a token boundary", () => {
-    // A truncated tag at the buffer end still trips the guard; the next delta may complete it.
+    // Wait for the next delta so a longer, ordinary tag is not mistaken for markup.
     const filter = new QoderScaffoldFilter();
-    expect(filter.push("leak <tool_call").fail).toContain("<tool_call");
+    expect(filter.push("leak <tool_call").fail).toBeNull();
+    expect(filter.flush().fail).toContain("<tool_call");
+  });
+
+  test("permits tool_call_count across delta boundaries", () => {
+    const filter = new QoderScaffoldFilter();
+    const first = filter.push("The XML field is <tool_call");
+    const second = filter.push("_count>3</tool_call_count>.");
+    const end = filter.flush();
+    expect(first.fail ?? second.fail ?? end.fail).toBeNull();
+    expect(first.text + second.text + end.text).toBe("The XML field is <tool_call_count>3</tool_call_count>.");
   });
 });
 

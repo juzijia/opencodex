@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import Ajv, { type ValidateFunction } from "ajv";
+import Ajv2019 from "ajv/dist/2019.js";
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
 import {
   namespacedToolName,
   toolChoiceToolPredicate,
@@ -109,6 +113,45 @@ const BOOLEAN_KEYWORDS = [
 ] as const;
 const textEncoder = new TextEncoder();
 
+const DRAFT_07_SCHEMA_URIS = new Set([
+  "http://json-schema.org/draft-07/schema",
+  "https://json-schema.org/draft-07/schema",
+]);
+const DRAFT_2019_09_SCHEMA_URIS = new Set([
+  "http://json-schema.org/draft/2019-09/schema",
+  "https://json-schema.org/draft/2019-09/schema",
+]);
+const DRAFT_2020_12_SCHEMA_URIS = new Set([
+  "http://json-schema.org/draft/2020-12/schema",
+  "https://json-schema.org/draft/2020-12/schema",
+]);
+
+// Keywords introduced in draft 2019-09. When a catalog omits `$schema` we
+// default to draft-07 (the SDK's historical behavior), so any modern keyword
+// would otherwise be silently ignored by the draft-07 compiler. Rejecting
+// instead of dropping a constraint keeps validation faithful to the declared
+// schema (F04).
+const KEYWORDS_2019_09_OR_LATER = new Set([
+  "$defs",
+  "$recursiveAnchor",
+  "$recursiveRef",
+  "contentSchema",
+  "dependentRequired",
+  "dependentSchemas",
+  "maxContains",
+  "minContains",
+  "unevaluatedItems",
+  "unevaluatedProperties",
+]);
+// `prefixItems` replaced the draft-07 tuple form of `items` in 2020-12; the
+// 2019-09 compiler would silently ignore it. The dynamic-reference pair and
+// `$vocabulary` versioning also arrive with 2020-12.
+const KEYWORDS_2020_12_ONLY = new Set([
+  "$dynamicAnchor",
+  "$dynamicRef",
+  "prefixItems",
+]);
+
 export interface CodeBuddyMcpToolDefinition {
   name: string;
   description: string;
@@ -120,6 +163,16 @@ export interface CodeBuddyToolBridge {
   /** Exact nested-CLI-emitted MCP name -> Responses wire name. */
   emittedNameMap: Map<string, string>;
   requireToolCall: boolean;
+  /**
+   * Request-local, precompiled argument validation keyed by the advertised MCP
+   * alias. Returns an error string when the arguments are invalid or the tool
+   * is not advertised, and undefined when they validate. The empty `none`
+   * bridge always fails closed.
+   */
+  validateArguments: (
+    name: string,
+    args: Record<string, unknown>,
+  ) => string | undefined;
 }
 
 interface PreparedTool {
@@ -127,6 +180,7 @@ interface PreparedTool {
   wireName: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  dialect: DialectDecision | undefined;
 }
 
 interface JsonCloneState {
@@ -454,6 +508,14 @@ function validateSchema(schema: Record<string, unknown>): void {
         invalidSchema("$vocabulary values must be booleans");
     }
   }
+  if (Object.hasOwn(schema, "$async")) {
+    // The bridge contract is a synchronous local JSON Schema validator.
+    // Accepting `$async` would let a Promise escape the synchronous turn
+    // path and be treated as a truthy validation result (F03).
+    if (typeof schema.$async !== "boolean")
+      invalidSchema("$async must be a boolean");
+    if (schema.$async) invalidSchema("$async schemas are not supported");
+  }
   if (Object.hasOwn(schema, "dependentRequired")) {
     if (!isRecord(schema.dependentRequired))
       invalidSchema("dependentRequired must be an object");
@@ -494,7 +556,201 @@ function validateSchema(schema: Record<string, unknown>): void {
   }
 }
 
-function normalizeInputSchema(parameters: unknown): Record<string, unknown> {
+interface DialectDecision {
+  kind: "draft7" | "2019" | "2020";
+}
+
+/**
+ * Decide which AJV dialect compiles a schema. A declared `$schema` selects
+ * its dialect; anything else is rejected so validation never silently picks a
+ * looser interpretation. With no declaration we default to draft-07, but a
+ * modern keyword anywhere in the schema is rejected with a pointer at the
+ * keyword instead of being ignored by the draft-07 compiler (F04).
+ */
+function schemaDialect(
+  schema: Record<string, unknown>,
+): DialectDecision | undefined {
+  if (Object.hasOwn(schema, "$schema")) {
+    if (typeof schema.$schema !== "string")
+      invalidSchema("$schema must be a string");
+    const uri = schema.$schema.replace(/#+$/, "");
+    if (DRAFT_07_SCHEMA_URIS.has(uri)) return { kind: "draft7" };
+    if (DRAFT_2019_09_SCHEMA_URIS.has(uri)) return { kind: "2019" };
+    if (DRAFT_2020_12_SCHEMA_URIS.has(uri)) return { kind: "2020" };
+    invalidSchema(`unsupported JSON Schema dialect: ${schema.$schema}`);
+  }
+  return undefined;
+}
+
+interface ModernKeywordHit {
+  keyword: string;
+  path: string;
+  minimumDialect: "2019" | "2020";
+}
+
+function modernKeywordHit(
+  schema: Record<string, unknown>,
+): ModernKeywordHit | undefined {
+  // Walk the schema like validateSchema: keyword children that hold schemas by
+  // name stay name bags (properties/patternProperties/$defs/definitions/
+  // dependentSchemas/dependentRequired), literal payload bags stay values
+  // (const/default/enum/examples), and every other object is a schema. This
+  // prevents a property literally named `dependentRequired` from
+  // false-positiving while still catching the keyword anywhere it applies.
+  interface ScanFrame {
+    value: unknown;
+    path: string;
+    inNameBag: boolean;
+  }
+  const stack: ScanFrame[] = [
+    { value: schema, path: "", inNameBag: false },
+  ];
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    const value = frame.value;
+    if (Array.isArray(value)) {
+      // Array entries are schemas in their own right (allOf/anyOf/oneOf/
+      // prefixItems/items tuples), never name bags.
+      for (let index = value.length - 1; index >= 0; index--) {
+        stack.push({
+          value: value[index],
+          path: `${frame.path}/${index}`,
+          inNameBag: false,
+        });
+      }
+      continue;
+    }
+    if (!isRecord(value)) continue;
+    for (const [key, child] of Object.entries(value)) {
+      if (frame.inNameBag) {
+        stack.push({ value: child, path: `${frame.path}/${key}`, inNameBag: false });
+        continue;
+      }
+      if (KEYWORDS_2019_09_OR_LATER.has(key)) {
+        return { keyword: key, path: `${frame.path}/${key}`, minimumDialect: "2019" };
+      }
+      if (KEYWORDS_2020_12_ONLY.has(key)) {
+        return { keyword: key, path: `${frame.path}/${key}`, minimumDialect: "2020" };
+      }
+      if (key === "dependencies") {
+        // A dependency is either a string array or a schema; either way the
+        // child values are not keyword positions themselves.
+        if (isRecord(child)) {
+          for (const [name, dependency] of Object.entries(child)) {
+            stack.push({
+              value: dependency,
+              path: `${frame.path}/${key}/${name}`,
+              inNameBag: false,
+            });
+          }
+        }
+        continue;
+      }
+      if (key === "items") {
+        if (Array.isArray(child)) {
+          for (let index = child.length - 1; index >= 0; index--) {
+            stack.push({
+              value: child[index],
+              path: `${frame.path}/items/${index}`,
+              inNameBag: false,
+            });
+          }
+        } else {
+          stack.push({ value: child, path: `${frame.path}/items`, inNameBag: false });
+        }
+        continue;
+      }
+      if (key === "const" || key === "default" || key === "enum" || key === "examples") {
+        continue;
+      }
+      if (SCHEMA_MAP_KEYWORDS.includes(key as (typeof SCHEMA_MAP_KEYWORDS)[number])) {
+        if (isRecord(child)) {
+          for (const [name, sub] of Object.entries(child)) {
+            stack.push({
+              value: sub,
+              path: `${frame.path}/${key}/${name}`,
+              inNameBag: false,
+            });
+          }
+        }
+        continue;
+      }
+      if (isRecord(child) || Array.isArray(child)) {
+        stack.push({ value: child, path: `${frame.path}/${key}`, inNameBag: false });
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Reject keywords the chosen dialect cannot enforce. A draft-07 default (no
+ * `$schema`) or declared draft-07 cannot apply 2019-09/2020-12 keywords, and
+ * a declared 2019-09 cannot apply 2020-12-only keywords. Failing loudly keeps
+ * every accepted constraint from being silently ignored (F04).
+ */
+function assertKeywordDialect(
+  schema: Record<string, unknown>,
+  dialect: DialectDecision | undefined,
+): void {
+  const hit = modernKeywordHit(schema);
+  if (!hit) return;
+  const path = hit.path || "the root";
+  if (dialect === undefined || dialect.kind === "draft7") {
+    invalidSchema(
+      `keyword ${hit.keyword} at ${path} requires the draft ${hit.minimumDialect === "2020" ? "2020-12" : "2019-09 or 2020-12"} dialect`,
+    );
+  }
+  if (dialect.kind === "2019" && hit.minimumDialect === "2020") {
+    invalidSchema(`keyword ${hit.keyword} at ${path} requires the draft 2020-12 dialect`);
+  }
+}
+
+interface CompiledSchema {
+  validate: ValidateFunction;
+  ajv: Ajv;
+}
+
+function compileSchemaWithDialect(
+  schema: Record<string, unknown>,
+  dialect: DialectDecision | undefined,
+): CompiledSchema {
+  if (dialect === undefined || dialect.kind === "draft7") {
+    const ajv = new Ajv({
+      strict: false,
+      validateSchema: false,
+      allErrors: true,
+      validateFormats: true,
+    });
+    addFormats(ajv);
+    return { validate: ajv.compile(schema), ajv };
+  }
+  if (dialect.kind === "2019") {
+    const ajv2019 = new Ajv2019({
+      strict: false,
+      validateSchema: false,
+      allErrors: true,
+      validateFormats: true,
+    });
+    addFormats(ajv2019 as unknown as Ajv);
+    return { validate: ajv2019.compile(schema), ajv: ajv2019 as unknown as Ajv };
+  }
+  const ajv2020 = new Ajv2020({
+    strict: false,
+    validateSchema: false,
+    allErrors: true,
+    validateFormats: true,
+  });
+  addFormats(ajv2020 as unknown as Ajv);
+  return { validate: ajv2020.compile(schema), ajv: ajv2020 as unknown as Ajv };
+}
+
+function normalizeInputSchema(
+  parameters: unknown,
+): {
+  inputSchema: Record<string, unknown>;
+  dialect: DialectDecision | undefined;
+} {
   if (!isRecord(parameters)) invalidSchema("the root must be an object schema");
   const cloned = cloneBoundedJson(parameters, 0, {
     active: new WeakSet(),
@@ -510,6 +766,8 @@ function normalizeInputSchema(parameters: unknown): Record<string, unknown> {
   if (Object.hasOwn(cloned, "type") && cloned.type !== "object") {
     invalidSchema('the root type must be "object"');
   }
+  const dialect = schemaDialect(cloned);
+  assertKeywordDialect(cloned, dialect);
 
   const stripped = stripResponsesOnlyEncryptedMarker(cloned);
   if (!isRecord(stripped))
@@ -520,7 +778,7 @@ function normalizeInputSchema(parameters: unknown): Record<string, unknown> {
       `schema exceeds ${CODEBUDDY_TOOL_LIMITS.maxSchemaBytes} bytes`,
     );
   }
-  return stripped;
+  return { inputSchema: stripped, dialect };
 }
 
 function shortHash(value: string, salt = 0): string {
@@ -562,7 +820,7 @@ export function codeBuddyToolAlias(
       return candidate;
     }
   }
-  throw new Error("CodeBuddy could not allocate a collision-free tool alias.");
+  throw new Error("Qoder could not allocate a collision-free tool alias.");
 }
 
 /** Reserve direct names before hashing and sort the rest so request ordering cannot change aliases. */
@@ -610,24 +868,24 @@ function prepareTool(
   seenWireNames: Set<string>,
 ): PreparedTool {
   if (!tool || typeof tool !== "object")
-    throw new Error(`CodeBuddy tool ${index + 1} is not an object.`);
+    throw new Error(`Qoder tool ${index + 1} is not an object.`);
   if (
     !validateToolNamePart(tool.name) ||
     (tool.namespace !== undefined && !validateToolNamePart(tool.namespace))
   ) {
     throw new Error(
-      `CodeBuddy tool ${index + 1} has an invalid name or namespace.`,
+      `Qoder tool ${index + 1} has an invalid name or namespace.`,
     );
   }
   const wireName = namespacedToolName(tool.namespace, tool.name);
   if (utf8Bytes(wireName) > CODEBUDDY_TOOL_LIMITS.maxNameBytes) {
     throw new Error(
-      `CodeBuddy tool ${index + 1} name exceeds ${CODEBUDDY_TOOL_LIMITS.maxNameBytes} bytes.`,
+      `Qoder tool ${index + 1} name exceeds ${CODEBUDDY_TOOL_LIMITS.maxNameBytes} bytes.`,
     );
   }
   if (seenWireNames.has(wireName)) {
     throw new Error(
-      `CodeBuddy tool catalog contains a duplicate wire name: ${wireName}.`,
+      `Qoder tool catalog contains a duplicate wire name: ${wireName}.`,
     );
   }
   seenWireNames.add(wireName);
@@ -637,32 +895,35 @@ function prepareTool(
     hasUnpairedSurrogate(tool.description) ||
     INVALID_DESCRIPTION_CONTROL_PATTERN.test(tool.description)
   ) {
-    throw new Error(`CodeBuddy tool ${index + 1} has an invalid description.`);
+    throw new Error(`Qoder tool ${index + 1} has an invalid description.`);
   }
   const description = tool.description || `Tool: ${wireName}`;
   if (utf8Bytes(description) > CODEBUDDY_TOOL_LIMITS.maxDescriptionBytes) {
     throw new Error(
-      `CodeBuddy tool ${index + 1} description exceeds ${CODEBUDDY_TOOL_LIMITS.maxDescriptionBytes} bytes.`,
+      `Qoder tool ${index + 1} description exceeds ${CODEBUDDY_TOOL_LIMITS.maxDescriptionBytes} bytes.`,
     );
   }
 
   let inputSchema: Record<string, unknown>;
+  let dialect: DialectDecision | undefined;
   try {
-    inputSchema = normalizeInputSchema(tool.parameters ?? {});
+    const normalized = normalizeInputSchema(tool.parameters ?? {});
+    inputSchema = normalized.inputSchema;
+    dialect = normalized.dialect;
   } catch (error) {
     const detail =
       error instanceof Error ? error.message : "unknown schema error";
     throw new Error(
-      `CodeBuddy tool ${index + 1} has an invalid input schema: ${detail}.`,
+      `Qoder tool ${index + 1} has an invalid input schema: ${detail}.`,
     );
   }
-  return { source: tool, wireName, description, inputSchema };
+  return { source: tool, wireName, description, inputSchema, dialect };
 }
 
 function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
   const allTools = parsed.context.tools ?? [];
   if (!Array.isArray(allTools))
-    throw new Error("CodeBuddy tool catalog must be an array.");
+    throw new Error("Qoder tool catalog must be an array.");
 
   const choice = parsed.options.toolChoice;
   const requireToolCall = requiresToolCall(choice);
@@ -671,7 +932,12 @@ function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
   // work, this prevents an unselected malformed or oversized definition from
   // turning an explicitly tool-free request into a local adapter failure.
   if (choice === "none") {
-    return { tools: [], emittedNameMap: new Map(), requireToolCall: false };
+    return {
+      tools: [],
+      emittedNameMap: new Map(),
+      requireToolCall: false,
+      validateArguments: (_name: string) => "no tools are advertised for this turn",
+    };
   }
 
   // Named and allowed-tools choices still need the complete identity view to
@@ -692,12 +958,12 @@ function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
     .filter(({ tool }) => allows(tool));
   if (requireToolCall && selected.length === 0) {
     throw new Error(
-      "CodeBuddy tool_choice requires a tool, but no matching tool is available.",
+      "Qoder tool_choice requires a tool, but no matching tool is available.",
     );
   }
   if (selected.length > CODEBUDDY_TOOL_LIMITS.maxTools) {
     throw new Error(
-      `CodeBuddy tool catalog exceeds the ${CODEBUDDY_TOOL_LIMITS.maxTools}-tool limit.`,
+      `Qoder tool catalog exceeds the ${CODEBUDDY_TOOL_LIMITS.maxTools}-tool limit.`,
     );
   }
 
@@ -706,6 +972,24 @@ function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
     prepareTool(tool, index, seenWireNames),
   );
   const aliases = codeBuddyToolAliases(prepared.map((tool) => tool.wireName));
+  // Compile each tool schema with a fresh, request-local AJV instance so no
+  // rule set outlives its turn and schemas sharing an `$id` can never bleed
+  // constraints into each other (F02).
+  const compiledByAlias = new Map<string, CompiledSchema>();
+  for (const tool of prepared) {
+    const alias = aliases.get(tool.wireName)!;
+    let compiled: CompiledSchema;
+    try {
+      compiled = compileSchemaWithDialect(tool.inputSchema, tool.dialect);
+    } catch (error) {
+      const detail =
+        error instanceof Error ? error.message : "unknown schema error";
+      throw new Error(
+        `Qoder tool ${prepared.indexOf(tool) + 1} has an invalid input schema: ${detail}.`,
+      );
+    }
+    compiledByAlias.set(alias, compiled);
+  }
   const definitions = prepared.map(
     (tool, index): CodeBuddyMcpToolDefinition => {
       const definition = {
@@ -715,7 +999,7 @@ function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
       };
       if (serializedBytes(definition) > CODEBUDDY_TOOL_LIMITS.maxToolBytes) {
         throw new Error(
-          `CodeBuddy tool ${index + 1} definition exceeds ${CODEBUDDY_TOOL_LIMITS.maxToolBytes} bytes.`,
+          `Qoder tool ${index + 1} definition exceeds ${CODEBUDDY_TOOL_LIMITS.maxToolBytes} bytes.`,
         );
       }
       return definition;
@@ -723,7 +1007,7 @@ function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
   );
   if (serializedBytes(definitions) > CODEBUDDY_TOOL_LIMITS.maxCatalogBytes) {
     throw new Error(
-      `CodeBuddy tool catalog exceeds ${CODEBUDDY_TOOL_LIMITS.maxCatalogBytes} bytes.`,
+      `Qoder tool catalog exceeds ${CODEBUDDY_TOOL_LIMITS.maxCatalogBytes} bytes.`,
     );
   }
 
@@ -733,14 +1017,24 @@ function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
     const emittedName = `${CODEBUDDY_MCP_TOOL_PREFIX}${definition.name}`;
     if (emittedNameMap.has(emittedName)) {
       throw new Error(
-        "CodeBuddy tool catalog contains a colliding emitted alias.",
+        "Qoder tool catalog contains a colliding emitted alias.",
       );
     }
     emittedNameMap.set(emittedName, preparedTool.wireName);
     return definition;
   });
 
-  return { tools, emittedNameMap, requireToolCall };
+  const validateArguments = (
+    name: string,
+    args: Record<string, unknown>,
+  ): string | undefined => {
+    const compiled = compiledByAlias.get(name);
+    if (!compiled) return `Unknown tool: ${name}.`;
+    if (compiled.validate(args)) return undefined;
+    return compiled.ajv.errorsText(compiled.validate.errors);
+  };
+
+  return { tools, emittedNameMap, requireToolCall, validateArguments };
 }
 
 export function buildCodeBuddyToolBridge(

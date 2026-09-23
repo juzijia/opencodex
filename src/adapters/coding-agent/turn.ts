@@ -1,12 +1,10 @@
 import { execFileSync, spawn as nodeSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { mkdtemp, rm, writeFile, readdir, readFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readdir, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { watch, type FSWatcher } from "node:fs";
-import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
-import type { JsonSchemaType } from "@modelcontextprotocol/sdk/validation";
-import { toolChoiceToolPredicate } from "../../types";
+import { namespacedToolName, toolChoiceToolPredicate } from "../../types";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../types";
 import { commandInvocation } from "../../lib/win-exec";
 import { modelRecordValue } from "../../reasoning-effort";
@@ -42,7 +40,9 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
 /** Bound captured stderr so an error message can never carry an unbounded (or secret) payload. */
 const MAX_STDERR_BYTES = 8 * 1024;
-const toolArgumentSchemaValidator = new AjvJsonSchemaValidator();
+// Some pinned CLIs park on MCP before emitting message_stop. Drain queued frames before that
+// fallback, and label its accounting as partial instead of claiming a complete usage snapshot.
+const CAPTURE_DRAIN_MS = 50;
 
 function killWindowsProcessTree(pid: number): void {
   const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
@@ -127,6 +127,8 @@ export interface CodingAgentToolBridgeInput {
   tools: ReadonlyArray<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
   /** CLI-emitted tool name (`mcp__<server>__<tool>`) to the request's wire tool name. */
   emittedNameMap: Map<string, string>;
+  /** Request-local, precompiled validation against the exact advertised MCP alias. */
+  validateArguments: (name: string, args: Record<string, unknown>) => string | undefined;
   /**
    * Captured tool_use blocks accepted in one assistant message. Side-channel v1 bridges accept
    * exactly one tool call per invocation; continuation requests start a new invocation.
@@ -214,6 +216,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   // The append-system-prompt temp file shares the bridge dir lifecycle when a bridge exists; on the
   // no-tools fast path it gets its own dir so MCP setup stays opt-in. Both are 0600 and reaped.
   let systemPromptDir: string | undefined;
+  const removeTemporaryFiles = async (): Promise<void> => {
+    if (toolBridgeDir) await rm(toolBridgeDir, { recursive: true, force: true }).catch(() => undefined);
+    if (systemPromptDir) await rm(systemPromptDir, { recursive: true, force: true }).catch(() => undefined);
+  };
   if (toolBridge) {
     if (toolBridge.tools.length === 0 || toolBridge.emittedNameMap.size === 0) {
       emit({ type: "error", message: "Coding-agent tool bridge was supplied without any isolated tools.", status: 500, errorType: "server_error", code: "tool_bridge_empty", retryable: false });
@@ -281,6 +287,11 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     }
   }
 
+  if (incoming.abortSignal?.aborted) {
+    await removeTemporaryFiles();
+    emit({ type: "error", message: `${profile.label} turn was aborted.`, retryable: false });
+    return;
+  }
   const args = buildArgs(profile, parsed, provider);
   if (appendSystemPromptPath) {
     args.push("--append-system-prompt-file", appendSystemPromptPath);
@@ -378,6 +389,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     stopStream();
   };
   incoming.abortSignal?.addEventListener("abort", onAbort, { once: true });
+  if (incoming.abortSignal?.aborted) onAbort();
   const timeoutTimer = setTimeout(() => {
     kill();
     stopStream();
@@ -391,7 +403,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
 
   let watcher: FSWatcher | undefined;
   let sideChannelPollTimer: ReturnType<typeof setInterval> | undefined;
+  let captureDrainTimer: ReturnType<typeof setTimeout> | undefined;
   const stopSideChannel = (): void => {
+    if (captureDrainTimer) clearTimeout(captureDrainTimer);
+    captureDrainTimer = undefined;
     if (watcher) {
       try {
         watcher.close();
@@ -427,6 +442,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   // present and agree on the wire tool identity.
   let nativeToolCall: { id: string; wireName: string } | undefined;
   let capturedToolCall: { wireName: string; arguments: Record<string, unknown> } | undefined;
+  let initValidated = false;
+  let captureDrainExpired = false;
+  let streamEnded = false;
+  let sideChannelCheck: Promise<void> | undefined;
   const state: StreamParseState = {
     sawPartialText: false,
     sawPartialThinking: false,
@@ -457,10 +476,26 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     // tool_use id and the validated MCP capture record are both present and name the same wire
     // tool. Never synthesizes a call id; a half that never arrives fails closed at turn end.
     const commitSideChannelCapture = (): void => {
-      if (captureCommitted || terminalEmitted || !toolBridge) return;
+      if (captureCommitted || terminalEmitted || incoming.abortSignal?.aborted || !toolBridge) return;
       const native = nativeToolCall;
       const captured = capturedToolCall;
       if (!native || !captured) return;
+      if (!state.sawMessageStop && !streamEnded && !captureDrainExpired) {
+        if (!captureDrainTimer) {
+          captureDrainTimer = setTimeout(() => {
+            captureDrainExpired = true;
+            void checkSideChannel().then(checkSideChannel).then(commitSideChannelCapture);
+          }, CAPTURE_DRAIN_MS);
+        }
+        return;
+      }
+      if (!initValidated) {
+        emitOnce({ type: "error", message: "Coding-agent tool bridge init frame was not observed before completion.", status: 502, errorType: "upstream_error", code: "tool_bridge_init_missing", retryable: false });
+        stopSideChannel();
+        kill();
+        stopStream();
+        return;
+      }
       if (native.wireName !== captured.wireName) {
         captureCommitted = true;
         stopSideChannel();
@@ -485,16 +520,24 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
         type: "done",
         stopReason: "tool_use",
         endTurn: false,
-        ...(state.partialUsage ? { usage: state.partialUsage } : {}),
+        ...(state.partialUsage ? { usage: { ...state.partialUsage, ...(!state.sawMessageStop ? { estimated: true } : {}) } } : {}),
       });
       kill();
       stopStream();
     };
-    const checkSideChannel = async (): Promise<void> => {
+    const readSideChannel = async (): Promise<void> => {
       if (captureCommitted || terminalEmitted || incoming.abortSignal?.aborted || !toolBridge || !toolBridgeDir) return;
       try {
         const files = await readdir(toolBridgeDir);
+        if (captureCommitted || terminalEmitted || incoming.abortSignal?.aborted) return;
         const captureFiles = files.filter(f => f.startsWith("capture-") && f.endsWith(".json")).sort();
+        if (captureFiles.length > 1) {
+          stopSideChannel();
+          emitOnce({ type: "error", message: "Invalid MCP capture sequence: multiple records in one invocation.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
+          kill();
+          stopStream();
+          return;
+        }
         for (const file of captureFiles) {
           if (captureCommitted || terminalEmitted || incoming.abortSignal?.aborted) break;
           if (acceptedCaptureFile !== undefined) {
@@ -510,10 +553,12 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           const filePath = join(toolBridgeDir, file);
           let content: string;
           try {
-            content = await readFile(filePath, "utf8");
-          } catch {
+            content = await readCaptureBounded(filePath);
+          } catch (err) {
+            if (err instanceof CodingAgentProtocolError) throw err;
             continue;
           }
+          if (captureCommitted || terminalEmitted || incoming.abortSignal?.aborted) return;
           if (Buffer.byteLength(content, "utf8") > MAX_CAPTURE_BYTES) {
             captureCommitted = true;
             stopSideChannel();
@@ -533,7 +578,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             stopStream();
             break;
           }
-          if (payload.version !== 1 || payload.nonce !== captureNonce) {
+          if (!payload || typeof payload !== "object" || payload.version !== 1 || payload.nonce !== captureNonce) {
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: "MCP capture nonce mismatch.", status: 502, errorType: "upstream_error", code: "tool_bridge_init_mismatch", retryable: false });
@@ -554,7 +599,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             stopStream();
             break;
           }
-          if (payload.arguments === null || typeof payload.arguments !== "object" || Array.isArray(payload.arguments)) {
+          if (payload.error === undefined && (payload.arguments === null || typeof payload.arguments !== "object" || Array.isArray(payload.arguments))) {
             captureCommitted = true;
             stopSideChannel();
             emitOnce({ type: "error", message: "MCP capture record has invalid arguments.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
@@ -574,6 +619,13 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             stopStream();
             break;
           }
+          if (payload.error !== undefined) {
+            stopSideChannel();
+            emitOnce({ type: "error", message: "MCP capture helper rejected the tool arguments.", status: 502, errorType: "upstream_error", code: payload.error === "tool_call_limit" ? "tool_call_limit" : "protocol_error", retryable: false });
+            kill();
+            stopStream();
+            return;
+          }
           const choice = parsed.options.toolChoice;
           if (choice === "none") {
             captureCommitted = true;
@@ -585,7 +637,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           }
           const allTools = parsed.context.tools ?? [];
           const predicate = toolChoiceToolPredicate(choice, allTools);
-          const matchingTool = allTools.find(t => (t.namespace ? `${t.namespace}.${t.name}` : t.name) === wireName);
+          const matchingTool = allTools.find(t => namespacedToolName(t.namespace, t.name) === wireName);
           if (!matchingTool || !predicate(matchingTool)) {
             captureCommitted = true;
             stopSideChannel();
@@ -609,11 +661,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           }
           let validationError: string | undefined;
           try {
-            const validator = toolArgumentSchemaValidator.getValidator(advertisedTool.inputSchema as JsonSchemaType);
-            const validation = validator(payload.arguments);
-            if (!validation.valid) {
-              validationError = validation.errorMessage ?? "schema validation failed";
-            }
+            validationError = toolBridge.validateArguments(advertisedTool.name, payload.arguments);
           } catch (err) {
             validationError = err instanceof Error ? err.message : "schema compilation failed";
           }
@@ -630,9 +678,21 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           commitSideChannelCapture();
           break;
         }
-      } catch {
-        /* ignore readdir errors during teardown */
+      } catch (err) {
+        if (err instanceof CodingAgentProtocolError && !terminalEmitted && !incoming.abortSignal?.aborted) {
+          emitOnce({ type: "error", message: err.message, status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
+          stopSideChannel();
+          kill();
+          stopStream();
+        }
+        // A directory removed during teardown needs no second terminal.
       }
+    };
+    // Watch, polling, and the stream can observe the same rename. One read/validation flight
+    // prevents stale callbacks from publishing after cancellation or completing a record twice.
+    const checkSideChannel = (): Promise<void> => {
+      sideChannelCheck ??= readSideChannel().finally(() => { sideChannelCheck = undefined; });
+      return sideChannelCheck;
     };
     if (toolBridge && toolBridge.captureMode === "side-channel" && toolBridgeDir) {
       const dir = toolBridgeDir;
@@ -648,7 +708,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
       }, 50);
     }
     try {
-      let initValidated = false;
       let toolCallStarts = 0;
       let failClosed = false;
       for await (const message of readJsonLines(stdout)) {
@@ -693,6 +752,12 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           }
           if (toolBridge?.captureMode === "side-channel" && (event.type === "tool_call_delta" || event.type === "tool_call_end")) {
             continue;
+          }
+          if (toolBridge && event.type === "done" && !initValidated) {
+            emitOnce({ type: "error", message: "Coding-agent tool bridge init frame was not observed before completion.", status: 502, errorType: "upstream_error", code: "tool_bridge_init_missing", retryable: false });
+            failClosed = true;
+            kill();
+            break;
           }
           if (
             toolBridge?.captureMode === "side-channel" &&
@@ -755,6 +820,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             : event);
         }
         if (toolBridge?.captureMode === "side-channel") {
+          if (state.sawMessageStop) {
+            await checkSideChannel();
+            await checkSideChannel();
+          }
           commitSideChannelCapture();
           if (captureCommitted) break;
         }
@@ -802,8 +871,11 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
       }
       // A short-lived fake or vendor process can close stdout before the watcher/poll callback
       // runs. Read the capture directory once more while it still exists, then join or fail closed.
+      streamEnded = true;
       if (!captureCommitted && toolBridge?.captureMode === "side-channel") {
         await checkSideChannel();
+        await checkSideChannel();
+        commitSideChannelCapture();
       }
     } catch (err) {
       kill();
@@ -814,10 +886,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     turnError = err instanceof Error ? err.message : String(err);
   } finally {
     cleanup();
-    if (toolBridgeDir) {
-      await rm(toolBridgeDir, { recursive: true, force: true }).catch(() => undefined);
-      if (systemPromptDir) await rm(systemPromptDir, { recursive: true, force: true }).catch(() => undefined);
-    }
+    if (sideChannelCheck) await sideChannelCheck;
   }
 
   // Reap the process so no zombie is left behind (§三十): wait for the real `close`, and
@@ -833,6 +902,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   clearTimeout(graceTimer);
   if (reapTimer) clearTimeout(reapTimer);
   if (killTimer) clearTimeout(killTimer);
+  await removeTemporaryFiles();
 
   if (!terminalEmitted && !captureCommitted) {
     const stderr = redactSecrets(boundedStderr(stderrChunks), profile.tokenEnv, apiKey);
@@ -902,6 +972,27 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
         retryable: false,
       });
     }
+  }
+}
+
+async function readCaptureBounded(path: string): Promise<string> {
+  const file = await open(path, "r");
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || stat.size > MAX_CAPTURE_BYTES) {
+      throw new CodingAgentProtocolError("MCP capture record exceeds the bounded regular-file contract.");
+    }
+    const bytes = Buffer.allocUnsafe(MAX_CAPTURE_BYTES + 1);
+    let used = 0;
+    while (used < bytes.length) {
+      const { bytesRead } = await file.read(bytes, used, bytes.length - used, used);
+      if (bytesRead === 0) break;
+      used += bytesRead;
+    }
+    if (used > MAX_CAPTURE_BYTES) throw new CodingAgentProtocolError("MCP capture record exceeds byte limit.");
+    return bytes.toString("utf8", 0, used);
+  } finally {
+    await file.close();
   }
 }
 

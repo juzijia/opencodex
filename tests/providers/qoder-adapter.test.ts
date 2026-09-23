@@ -35,10 +35,10 @@ describe("qoder adapter", () => {
     const request = parsed({ context: { systemPrompt: ["caller system prompt"], messages: [{ role: "user", content: "hello", timestamp: 0 }] } });
     const result = buildQoderAppendSystemPrompt(request, { tools: [{ name: "shell", description: "run a command", inputSchema: {} }] });
     expect(result!.startsWith("caller system prompt")).toBe(true);
-    expect(result).toContain("is available");
-    expect(result).toContain("Codex Responses-compatible tool-call surface");
-    expect(result).toContain("host client performs approval, sandboxing, and execution");
-    expect(result).toContain("at most one tool call in this invocation");
+    expect(result).toContain("Use only the tools advertised for this turn");
+    expect(result).toContain("host authorizes and executes it");
+    expect(result).toContain("at most one tool call per invocation");
+    expect(result).toContain("after the matching result arrives");
     expect(result).not.toContain("Your built-in tools and user-configured MCP servers are disabled");
     expect(result).not.toContain("never executes a tool");
     expect(result).not.toContain("external Codex client");
@@ -61,7 +61,8 @@ describe("qoder adapter", () => {
     expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
     expect(args).toContain("--strict-mcp-config");
     expect(args).toContain("--no-session-persistence");
-    expect(args).not.toContain("--max-turns");
+    expect(args[args.indexOf("--max-turns") + 1]).toBe("1");
+    expect(buildQoderArgs(parsed(), provider(), { tools: [{ name: "shell", description: "", inputSchema: {} }] })).not.toContain("--max-turns");
     expect(args[args.indexOf("--reasoning-effort") + 1]).toBe("high");
     expect(args).not.toContain("--dangerously-skip-permissions");
   });

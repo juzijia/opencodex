@@ -162,6 +162,100 @@ const BLOCK_STOP = {
 };
 const MESSAGE_STOP = { type: "stream_event", event: { type: "message_stop" } };
 
+describe("Qoder bridge remediation", () => {
+  function capturedAdapter(p: OcxParsedRequest, frames: (name: string) => unknown[]) {
+    const bridge = buildQoderToolBridge(p);
+    return createQoderAdapter(provider(), {
+      which: () => "/usr/bin/qoder",
+      spawn: (_cmd, args) => {
+        const { captureDir, nonce } = captureConfig(args);
+        writeCaptureFile(captureDir, nonce, 1, bridge.tools[0]!.name, { a: 1 });
+        return fakeChild(frameLines(frames([...bridge.emittedNameMap.keys()][0]!))) as unknown as ChildProcess;
+      },
+    });
+  }
+
+  test.each(["auto", { name: "mcp__alpha__lookup" }] as const)("accepts namespaced capture with choice %j", async choice => {
+    const p = parsed([{ ...tool("lookup"), namespace: "mcp__alpha" }]);
+    p.options.toolChoice = choice;
+    const events = await run(capturedAdapter(p, name => [INIT_OK, toolUseStart(name), BLOCK_STOP, MESSAGE_STOP]), p);
+    expect(events[0]).toMatchObject({ type: "tool_call_start", name: "mcp__alpha__lookup" });
+    expect(events.at(-1)?.type).toBe("done");
+  });
+
+  test("requires a verified init before side-channel success", async () => {
+    const p = parsed([tool("lookup")]);
+    const events = await run(capturedAdapter(p, name => [toolUseStart(name), BLOCK_STOP, MESSAGE_STOP]), p);
+    expect(events.some(e => e.type === "tool_call_start")).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "tool_bridge_init_missing" });
+  });
+
+  test("drains usage after tool start before committing", async () => {
+    const p = parsed([tool("lookup")]);
+    const events = await run(capturedAdapter(p, name => [
+      INIT_OK,
+      { type: "stream_event", event: { type: "message_start", message: { usage: { input_tokens: 100 } } } },
+      toolUseStart(name), BLOCK_STOP,
+      { type: "stream_event", event: { type: "message_delta", usage: { output_tokens: 30 } } },
+      MESSAGE_STOP,
+    ]), p);
+    expect(events.at(-1)).toMatchObject({ type: "done", usage: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } });
+  });
+
+  test("rejects two captures arriving together after init", async () => {
+    const p = parsed([tool("lookup")]);
+    const bridge = buildQoderToolBridge(p);
+    const adapter = createQoderAdapter(provider(), {
+      which: () => "/usr/bin/qoder",
+      spawn: (_cmd, args) => {
+        const { captureDir, nonce } = captureConfig(args);
+        const child = fakeChild([]);
+        child.stdout = Readable.from((async function* () {
+          yield frameLines([INIT_OK])[0]!;
+          await Bun.sleep(20);
+          writeCaptureFile(captureDir, nonce, 1, bridge.tools[0]!.name, { a: 1 });
+          writeCaptureFile(captureDir, nonce, 2, bridge.tools[0]!.name, { a: 2 });
+          yield* frameLines([toolUseStart([...bridge.emittedNameMap.keys()][0]!), BLOCK_STOP, MESSAGE_STOP]);
+        })());
+        return child as unknown as ChildProcess;
+      },
+    });
+    const events = await run(adapter, p);
+    expect(events.some(e => e.type === "tool_call_start")).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error" });
+  });
+
+  test("removes a system prompt directory without a tool bridge", async () => {
+    let promptPath = "";
+    const p = parsed();
+    p.context.systemPrompt = ["synthetic cleanup regression"];
+    const adapter = createQoderAdapter(provider(), {
+      which: () => "/usr/bin/qoder",
+      spawn: (_cmd, args) => {
+        promptPath = args[args.indexOf("--append-system-prompt-file") + 1]!;
+        return fakeChild(frameLines([{ type: "result", subtype: "success" }])) as unknown as ChildProcess;
+      },
+    });
+    await run(adapter, p);
+    expect(promptPath).not.toBe("");
+    expect(existsSync(dirname(promptPath))).toBe(false);
+  });
+
+  test("does not spawn after cancellation during temporary-file preparation", async () => {
+    const controller = new AbortController();
+    let spawns = 0;
+    const adapter = createQoderAdapter(provider(), {
+      which: () => "/usr/bin/qoder",
+      spawn: () => { spawns++; return fakeChild([]) as unknown as ChildProcess; },
+    });
+    const events: AdapterEvent[] = [];
+    queueMicrotask(() => controller.abort());
+    await adapter.runTurn!(parsed([tool("lookup")]), { ...incoming(), abortSignal: controller.signal }, e => events.push(e));
+    expect(spawns).toBe(0);
+    expect(events.at(-1)).toMatchObject({ type: "error", retryable: false });
+  });
+});
+
 function captureConfig(args: readonly string[]): {
   captureDir: string;
   nonce: string;
@@ -298,6 +392,7 @@ describe("Qoder capture-only tool bridge turn", () => {
         inputTokens: 12,
         outputTokens: 5,
         totalTokens: 17,
+        estimated: true,
       },
     });
   });
@@ -331,7 +426,7 @@ describe("Qoder capture-only tool bridge turn", () => {
     expect(events.at(-1)).toMatchObject({
       type: "done",
       stopReason: "tool_use",
-      usage: { inputTokens: 31, outputTokens: 0, totalTokens: 31 },
+      usage: { inputTokens: 31, estimated: true },
     });
   });
 
@@ -369,6 +464,7 @@ describe("Qoder capture-only tool bridge turn", () => {
     let child: FakeChild | undefined;
     const spawn: SpawnFn = (_cmd, _args) => {
       child = fakeChild([
+        enc.encode(JSON.stringify(INIT_OK) + "\n"),
         enc.encode('{"type":"result","subtype":"success"}\n'),
       ]);
       return child as unknown as ChildProcess;
@@ -391,6 +487,7 @@ describe("Qoder capture-only tool bridge turn", () => {
     const p = parsed([tool("exec")]);
     const spawn: SpawnFn = () =>
       fakeChild([
+        enc.encode(JSON.stringify(INIT_OK) + "\n"),
         enc.encode('{"type":"result","subtype":"success"}\n'),
       ]) as unknown as ChildProcess;
     const adapter = createQoderAdapter(provider(), {
@@ -399,6 +496,17 @@ describe("Qoder capture-only tool bridge turn", () => {
     });
     const events = await run(adapter, p);
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop" });
+  });
+
+  test("rejects a text-only result when the MCP init frame is missing", async () => {
+    const p = parsed([tool("exec")]);
+    const adapter = createQoderAdapter(provider(), {
+      spawn: () => fakeChild([enc.encode('{"type":"result","subtype":"success"}\n')]) as unknown as ChildProcess,
+      which: () => "/usr/bin/qoder",
+    });
+    const events = await run(adapter, p);
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "tool_bridge_init_missing" });
+    expect(events.some(e => e.type === "done")).toBe(false);
   });
 
   test("a synchronous spawn throw still removes the private temp dir", async () => {
@@ -775,6 +883,7 @@ describe("Qoder side-channel capture", () => {
     p.options = { toolChoice: "required" } as OcxParsedRequest["options"];
     const spawn: SpawnFn = () =>
       fakeChild([
+        enc.encode(JSON.stringify(INIT_OK) + "\n"),
         enc.encode('{"type":"result","subtype":"success"}\n'),
       ]) as unknown as ChildProcess;
     const adapter = createQoderAdapter(provider(), {
