@@ -201,6 +201,11 @@ if (process.argv[2] === "__codebuddy-mcp") {
   // to ordinary CLI dispatch or exit after the handshake completes.
   await new Promise<never>(() => {});
 }
+if (process.argv[2] === "__qoder-mcp") {
+  const { runQoderMcpServer } = await import("../adapters/qoder/mcp-server");
+  await runQoderMcpServer(process.argv[3] ?? "");
+  await new Promise<never>(() => {});
+}
 
 // Head: version/help early exits, `ready` pre-parse (exit 64 before any
 // preflight), and the bounded Codex-shim auto-restore preflight live in
