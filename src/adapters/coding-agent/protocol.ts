@@ -221,8 +221,25 @@ export interface StreamParseState {
   partialToolCallIds?: Set<string>;
   /** A complete assistant tool block had no matching partial capture. */
   uncapturedToolUse?: boolean;
+  /** Qoder can emit a tool_use only in a complete assistant frame. */
+  allowCompleteToolCalls?: boolean;
+  /** Tool IDs already seen in either partial or complete frames. */
+  seenToolCallIds?: Set<string>;
   /** Highest-seen usage snapshot from `message_delta`/assistant frames before a terminal result. */
   partialUsage?: OcxUsage;
+}
+
+/** Shared wire contract for a capture-only MCP bridge side channel. */
+export const MAX_CAPTURE_BYTES = 256 * 1024;
+
+export interface ToolBridgeCapturePayload {
+  version: 1;
+  nonce: string;
+  sequence: number;
+  name: string;
+  arguments: Record<string, unknown>;
+  /** Bounded helper failure; no oversized argument content is copied into the record. */
+  error?: "tool_call_limit";
 }
 
 /**
@@ -260,7 +277,23 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
           if (thinking) events.push({ type: "thinking_delta", thinking });
         } else if (blockType === "tool_use") {
           const id = asString(part.id);
-          if (!id || !state.partialToolCallIds?.has(id)) state.uncapturedToolUse = true;
+          if (state.allowCompleteToolCalls) {
+            const name = asString(part.name);
+            if (!id || !name) continue;
+            if (state.seenToolCallIds?.has(id)) {
+              if (state.openToolCallId === id) {
+                state.openToolCallId = undefined;
+                state.completedToolCalls = (state.completedToolCalls ?? 0) + 1;
+                events.push({ type: "tool_call_end" });
+              }
+              continue;
+            }
+            (state.seenToolCallIds ??= new Set()).add(id);
+            state.completedToolCalls = (state.completedToolCalls ?? 0) + 1;
+            events.push({ type: "tool_call_start", id, name }, { type: "tool_call_end" });
+          } else if (!id || !state.partialToolCallIds?.has(id)) {
+            state.uncapturedToolUse = true;
+          }
         }
       }
     }
@@ -360,6 +393,7 @@ function mapRawStreamEvent(event: StreamMessage, state: StreamParseState): Adapt
       if (id) {
         state.openToolCallId = id;
         state.partialToolCallIds?.add(id);
+        (state.seenToolCallIds ??= new Set()).add(id);
         events.push({ type: "tool_call_start", id, name });
       }
     }

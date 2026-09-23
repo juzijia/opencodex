@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { existsSync, readFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { buildQoderArgs, buildQoderChildEnv, createQoderAdapter } from "../../src/adapters/qoder/adapter";
+import { buildQoderAppendSystemPrompt, buildQoderArgs, buildQoderChildEnv, createQoderAdapter } from "../../src/adapters/qoder/adapter";
 import { clearQoderBinaryCache, QODER_CN_PROFILE, QODER_GLOBAL_PROFILE, resolveQoderProfile } from "../../src/adapters/qoder/profiles";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
@@ -31,6 +32,27 @@ function fakeChild(frames: string[]): ChildProcess {
 }
 
 describe("qoder adapter", () => {
+  test("appends the tool bridge contract after the caller system prompt when tools are bridged", () => {
+    const request = parsed({ context: { systemPrompt: ["caller system prompt"], messages: [{ role: "user", content: "hello", timestamp: 0 }] } });
+    const result = buildQoderAppendSystemPrompt(request, { tools: [{ name: "shell", description: "run a command", inputSchema: {} }] });
+    expect(result!.startsWith("caller system prompt")).toBe(true);
+    expect(result).toContain("Use only the tools advertised for this turn");
+    expect(result).toContain("host authorizes and executes it");
+    expect(result).toContain("at most one tool call per invocation");
+    expect(result).toContain("after the matching result arrives");
+    expect(result).not.toContain("Your built-in tools and user-configured MCP servers are disabled");
+    expect(result).not.toContain("never executes a tool");
+    expect(result).not.toContain("external Codex client");
+  });
+
+  test("does not append the tool bridge contract when no tools are bridged", () => {
+    const request = parsed({ context: { systemPrompt: ["caller system prompt"], messages: [{ role: "user", content: "hello", timestamp: 0 }] } });
+    const result = buildQoderAppendSystemPrompt(request, { tools: [] });
+    expect(result).toBe("caller system prompt");
+    expect(result).not.toContain("is available");
+    expect(result).not.toContain("Codex Responses-compatible tool-call surface");
+  });
+
   test("uses only the Global PAT and disables tools, MCP, settings hooks, and persistence", () => {
     const env = buildQoderChildEnv(QODER_GLOBAL_PROFILE, "qoder-pat");
     expect(env.QODER_PERSONAL_ACCESS_TOKEN).toBe("qoder-pat");
@@ -40,20 +62,26 @@ describe("qoder adapter", () => {
     expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
     expect(args).toContain("--strict-mcp-config");
     expect(args).toContain("--no-session-persistence");
+    expect(args[args.indexOf("--max-turns") + 1]).toBe("1");
+    expect(buildQoderArgs(parsed(), provider(), { tools: [{ name: "shell", description: "", inputSchema: {} }] })).not.toContain("--max-turns");
     expect(args[args.indexOf("--reasoning-effort") + 1]).toBe("high");
     expect(args).not.toContain("--dangerously-skip-permissions");
   });
 
-  test("passes system and developer prompts only in the scoped child environment", async () => {
+  test("passes system and developer prompts through a private temporary file", async () => {
     const secretSystem = "private system instructions";
     const secretDeveloper = "private developer context";
     let args: readonly string[] = [];
     let childEnv: NodeJS.ProcessEnv = {};
+    let promptPath = "";
+    let promptContents = "";
     const adapter = createQoderAdapter(provider(), {
       which: () => "/bin/qoder",
       spawn: (_command, childArgs, options) => {
         args = childArgs;
         childEnv = options.env ?? {};
+        promptPath = childArgs[childArgs.indexOf("--append-system-prompt-file") + 1] ?? "";
+        promptContents = readFileSync(promptPath, "utf8");
         return fakeChild(['{"type":"result","subtype":"success","is_error":false}\n']);
       },
     });
@@ -69,8 +97,10 @@ describe("qoder adapter", () => {
 
     expect(args.join(" ")).not.toContain(secretSystem);
     expect(args.join(" ")).not.toContain(secretDeveloper);
-    expect(args).not.toContain("--append-system-prompt-file");
-    expect(childEnv.QODER_APPEND_SYSTEM_PROMPT).toBe(`${secretSystem}\n\n${secretDeveloper}`);
+    expect(args).toContain("--append-system-prompt-file");
+    expect(promptContents).toBe(`${secretSystem}\n\n${secretDeveloper}`);
+    expect(childEnv.QODER_APPEND_SYSTEM_PROMPT).toBeUndefined();
+    expect(existsSync(promptPath)).toBe(false);
   });
 
   test("never inherits an ambient Qoder prompt for either region", () => {
@@ -83,7 +113,6 @@ describe("qoder adapter", () => {
         expect(buildQoderChildEnv(profile, "pat").QODER_APPEND_SYSTEM_PROMPT).toBeUndefined();
         const promptEnv = profile.region === "cn" ? "QODERCN_APPEND_SYSTEM_PROMPT" : "QODER_APPEND_SYSTEM_PROMPT";
         expect(buildQoderChildEnv(profile, "pat")[promptEnv]).toBeUndefined();
-        expect(buildQoderChildEnv(profile, "pat", "request-only")[promptEnv]).toBe("request-only");
       }
     } finally {
       if (previous === undefined) delete process.env.QODER_APPEND_SYSTEM_PROMPT;

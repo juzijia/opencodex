@@ -36,10 +36,20 @@ const REMINDER_CLOSE = "</system-reminder>";
  * text is not possible. A stray `</system-reminder>` with no opener is in the same class:
  * the block it belonged to was already partly forwarded, or never existed.
  */
-const UNREPAIRABLE_MARKERS = ["<functions.", "<invoke name=", "<invoke>", "</invoke>", REMINDER_CLOSE] as const;
+const UNREPAIRABLE_MARKERS = [
+  "<functions.",
+  "<function=",
+  "<tool_call>",
+  "<tool_call",
+  "</tool_call>",
+  "<invoke name=",
+  "<invoke>",
+  "</invoke>",
+  REMINDER_CLOSE,
+] as const;
 
 /** Markers that end a block rather than start one; their prefix is never an answer. */
-const CLOSING_MARKERS = new Set<string>(["</invoke>", REMINDER_CLOSE]);
+const CLOSING_MARKERS = new Set<string>(["</invoke>", "</tool_call>", REMINDER_CLOSE]);
 
 /** Every marker the scanner must be able to recognize mid-split. */
 const ALL_MARKERS = [REMINDER_OPEN, ...UNREPAIRABLE_MARKERS] as const;
@@ -57,6 +67,11 @@ const MAX_MARKER_LENGTH = Math.max(...ALL_MARKERS.map(marker => marker.length));
 function reminderOpensHere(text: string, at: number): boolean {
   const after = text[at + REMINDER_OPEN.length];
   return after === undefined || /[\s/>]/.test(after);
+}
+
+function toolCallOpensHere(text: string, at: number): boolean {
+  const after = text[at + "<tool_call".length];
+  return after !== undefined && /[\s/>]/.test(after);
 }
 
 /**
@@ -114,7 +129,7 @@ function heldSuffixLength(text: string): number {
   const limit = Math.min(MAX_MARKER_LENGTH - 1, text.length);
   for (let length = limit; length > 0; length--) {
     for (const marker of ALL_MARKERS) {
-      if (marker.length > length && indexOfMarker(text, marker.slice(0, length), text.length - length) >= 0) {
+      if ((marker.length > length || (marker === "<tool_call" && marker.length === length)) && indexOfMarker(text, marker.slice(0, length), text.length - length) >= 0) {
         return length;
       }
     }
@@ -197,6 +212,9 @@ export class QoderScaffoldFilter {
         while (at >= 0 && marker === REMINDER_OPEN && !reminderOpensHere(buffer, at)) {
           at = indexOfMarker(buffer, marker, at + 1);
         }
+        while (at >= 0 && marker === "<tool_call" && !toolCallOpensHere(buffer, at)) {
+          at = indexOfMarker(buffer, marker, at + 1);
+        }
         if (at < 0) continue;
         // A closer sitting exactly where an opener starts cannot happen, so ties are impossible.
         if (earliest < 0 || at < earliest) {
@@ -239,6 +257,7 @@ export class QoderScaffoldFilter {
     if (this.mode === "suppress") return this.fail("", `an unterminated ${REMINDER_OPEN}> block`);
     const text = this.pending;
     this.pending = "";
+    if (text.toLowerCase() === "<tool_call") return this.fail("", "vendor tool-call markup (<tool_call)");
     return { text, fail: null };
   }
 

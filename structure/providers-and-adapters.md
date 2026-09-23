@@ -14,12 +14,11 @@ The capture-only bridge in `src/adapters/coding-agent/turn.ts` reports staging f
 the fixed `tool_bridge_setup_failed` error, never an OS error carrying private file paths.
 Failure prevents CLI spawn and settles the bridge's private directory; the CodeBuddy adapter
 also settles its prompt-file directory. Catalog and MCP-config write failures cover both owners.
-In a compiled executable, the bridge launches the private `__codebuddy-mcp` CLI entrypoint;
-source execution launches the MCP module with Bun. Both paths advertise only the request's
-isolated catalog and leave tool execution to the external client. Qoder appends the folded
-system prompt through its documented scoped `QODER_APPEND_SYSTEM_PROMPT` or
-`QODERCN_APPEND_SYSTEM_PROMPT` child environment,
-never through command-line arguments or inherited vendor variables.
+In a compiled executable, the bridge launches the private `__codebuddy-mcp` or
+`__qoder-mcp` CLI entrypoint; source execution launches the corresponding MCP module with
+Bun. Both paths advertise only the request's isolated catalog and leave tool execution to
+the external client. Qoder appends the folded system prompt through a private 0600 file,
+passed with `--append-system-prompt-file` and removed after the turn.
 
 Kimi Coding's Chat, API-key, and optional Responses presets consume the same model seeds in
 `src/providers/registry/model-seeds.ts`, including the native `k3-256k` ID. The Responses preset
