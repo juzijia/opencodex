@@ -34,7 +34,7 @@ import { requiresPlaintextReasoningReplay } from "../../adapters/openai-response
  * Adapters whose continuation state must survive Codex's store:false requests.
  */
 export function adapterNeedsForcedContinuation(name: string): boolean {
-  return name === "kiro" || name === "cursor";
+  return name === "kiro" || name === "cursor" || name === "qoder";
 }
 
 
