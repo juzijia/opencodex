@@ -12,9 +12,9 @@ import {
 } from "../coding-agent/turn";
 import {
   buildToolBridge,
-  CODEBUDDY_MCP_SERVER_NAME,
-  CODEBUDDY_TOOL_LIMITS,
-  type CodeBuddyToolBridge,
+  QODER_MCP_SERVER_NAME,
+  QODER_TOOL_LIMITS,
+  type QoderToolBridge,
 } from "./tool-bridge";
 import { QODER_PROFILES, type QoderProfile } from "./profiles";
 import { QoderScaffoldFilter, QODER_SCAFFOLD_ERROR_CODE, qoderScaffoldErrorMessage } from "./scaffold-guard";
@@ -22,7 +22,7 @@ import { QoderScaffoldFilter, QODER_SCAFFOLD_ERROR_CODE, qoderScaffoldErrorMessa
 export type { SpawnFn } from "../coding-agent/turn";
 export type QoderAdapterDeps = CodingAgentDeps;
 
-export const QODER_MCP_SERVER_NAME = CODEBUDDY_MCP_SERVER_NAME;
+export { QODER_MCP_SERVER_NAME };
 const QODER_MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.ts", import.meta.url));
 
 const TOOL_BRIDGE_SYSTEM_PROMPT = [
@@ -44,7 +44,7 @@ export function buildQoderChildEnv(profile: QoderProfile, apiKey: string): Recor
 export function buildQoderArgs(
   parsed: OcxParsedRequest,
   provider: OcxProviderConfig,
-  toolBridge?: Pick<CodeBuddyToolBridge, "tools">,
+  toolBridge?: Pick<QoderToolBridge, "tools">,
 ): string[] {
   const args = [
     "-p",
@@ -69,7 +69,7 @@ export function buildQoderArgs(
  */
 export function buildQoderAppendSystemPrompt(
   parsed: OcxParsedRequest,
-  toolBridge?: Pick<CodeBuddyToolBridge, "tools">,
+  toolBridge?: Pick<QoderToolBridge, "tools">,
 ): string | undefined {
   const systemParts: string[] = [];
   const system = buildSystemPrompt(parsed);
@@ -215,7 +215,7 @@ export function extractConversationSemanticText(lines: readonly string[]): strin
  */
 export function estimateQoderVisibleInputTokens(
   parsed: OcxParsedRequest,
-  toolBridge?: Pick<CodeBuddyToolBridge, "tools">,
+  toolBridge?: Pick<QoderToolBridge, "tools">,
   provider?: OcxProviderConfig,
 ): number {
   const parts: string[] = [];
@@ -382,7 +382,7 @@ export function createQoderAdapter(provider: OcxProviderConfig, deps: QoderAdapt
         });
         return;
       }
-      let toolBridge: CodeBuddyToolBridge;
+      let toolBridge: QoderToolBridge;
       try {
         toolBridge = buildToolBridge(parsed);
       } catch (err) {
@@ -404,7 +404,7 @@ export function createQoderAdapter(provider: OcxProviderConfig, deps: QoderAdapt
               tools: toolBridge.tools,
               emittedNameMap: toolBridge.emittedNameMap,
               validateArguments: toolBridge.validateArguments,
-              maxTurnToolCalls: CODEBUDDY_TOOL_LIMITS.maxTurnToolCalls,
+              maxTurnToolCalls: QODER_TOOL_LIMITS.maxTurnToolCalls,
               requireToolCall: toolBridge.requireToolCall,
               allowedToolsFlag: "--allowed-tools",
               captureMode: "side-channel",

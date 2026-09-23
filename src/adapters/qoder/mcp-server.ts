@@ -1,8 +1,8 @@
 /**
- * Isolated MCP catalog used by the CodeBuddy adapter.
+ * Isolated MCP catalog used by the Qoder adapter.
  *
  * This process advertises the current Codex tool schemas but deliberately never
- * executes a call. The parent adapter captures CodeBuddy's completed `tool_use`
+ * executes a call. The parent adapter captures Qoder's completed `tool_use`
  * frame, terminates this process tree, and returns the call to the Codex host,
  * where the normal approval and sandbox boundary remains authoritative.
  */
@@ -17,7 +17,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
-  CODEBUDDY_TOOL_LIMITS,
+  QODER_TOOL_LIMITS,
 } from "./tool-bridge";
 import {
   MAX_CAPTURE_BYTES,
@@ -63,14 +63,14 @@ async function readCatalogBounded(path: string): Promise<Buffer> {
     const before = await handle.stat();
     if (!before.isFile())
       throw new Error("tool catalog must be a regular file");
-    if (before.size > CODEBUDDY_TOOL_LIMITS.maxCatalogBytes) {
+    if (before.size > QODER_TOOL_LIMITS.maxCatalogBytes) {
       throw new Error("tool catalog is too large");
     }
 
     // Read at most limit + 1 from the already-open descriptor. The extra byte
     // distinguishes an exact-limit file from a file that grew after fstat,
     // without ever allocating or retaining an attacker-sized input.
-    const bytes = Buffer.allocUnsafe(CODEBUDDY_TOOL_LIMITS.maxCatalogBytes + 1);
+    const bytes = Buffer.allocUnsafe(QODER_TOOL_LIMITS.maxCatalogBytes + 1);
     let offset = 0;
     while (offset < bytes.length) {
       const result = await handle.read(
@@ -82,7 +82,7 @@ async function readCatalogBounded(path: string): Promise<Buffer> {
       if (result.bytesRead === 0) break;
       offset += result.bytesRead;
     }
-    if (offset > CODEBUDDY_TOOL_LIMITS.maxCatalogBytes) {
+    if (offset > QODER_TOOL_LIMITS.maxCatalogBytes) {
       throw new Error("tool catalog is too large");
     }
 
@@ -107,7 +107,7 @@ function assertBoundedSchema(schema: Record<string, unknown>): void {
   if (schema.type !== "object")
     throw new Error("tool input schema must have object type");
   if (
-    utf8Bytes(JSON.stringify(schema)) > CODEBUDDY_TOOL_LIMITS.maxSchemaBytes
+    utf8Bytes(JSON.stringify(schema)) > QODER_TOOL_LIMITS.maxSchemaBytes
   ) {
     throw new Error("tool input schema is too large");
   }
@@ -119,10 +119,10 @@ function assertBoundedSchema(schema: Record<string, unknown>): void {
   while (pending.length > 0) {
     const current = pending.pop()!;
     nodes += 1;
-    if (nodes > CODEBUDDY_TOOL_LIMITS.maxSchemaNodes) {
+    if (nodes > QODER_TOOL_LIMITS.maxSchemaNodes) {
       throw new Error("tool input schema has too many nodes");
     }
-    if (current.depth > CODEBUDDY_TOOL_LIMITS.maxSchemaDepth) {
+    if (current.depth > QODER_TOOL_LIMITS.maxSchemaDepth) {
       throw new Error("tool input schema is too deeply nested");
     }
     if (Array.isArray(current.value)) {
@@ -145,7 +145,7 @@ async function loadTools(path: string): Promise<ToolDefinition[]> {
     throw new Error("tool catalog contains malformed JSON");
   }
   if (!Array.isArray(parsed)) throw new Error("tool catalog must be an array");
-  if (parsed.length > CODEBUDDY_TOOL_LIMITS.maxTools) {
+  if (parsed.length > QODER_TOOL_LIMITS.maxTools) {
     throw new Error("tool catalog contains too many definitions");
   }
 
@@ -155,13 +155,13 @@ async function loadTools(path: string): Promise<ToolDefinition[]> {
       !isRecord(value) ||
       typeof value.name !== "string" ||
       !MCP_TOOL_NAME_PATTERN.test(value.name) ||
-      utf8Bytes(value.name) > CODEBUDDY_TOOL_LIMITS.maxNameBytes ||
+      utf8Bytes(value.name) > QODER_TOOL_LIMITS.maxNameBytes ||
       typeof value.description !== "string" ||
       value.description.length < 1 ||
       hasUnpairedSurrogate(value.description) ||
       INVALID_DESCRIPTION_CONTROL_PATTERN.test(value.description) ||
       utf8Bytes(value.description) >
-        CODEBUDDY_TOOL_LIMITS.maxDescriptionBytes ||
+        QODER_TOOL_LIMITS.maxDescriptionBytes ||
       !isRecord(value.inputSchema)
     ) {
       throw new Error("tool catalog contains an invalid definition");
@@ -176,7 +176,7 @@ async function loadTools(path: string): Promise<ToolDefinition[]> {
       inputSchema: value.inputSchema,
     };
     if (
-      utf8Bytes(JSON.stringify(definition)) > CODEBUDDY_TOOL_LIMITS.maxToolBytes
+      utf8Bytes(JSON.stringify(definition)) > QODER_TOOL_LIMITS.maxToolBytes
     ) {
       throw new Error("tool catalog contains an oversized definition");
     }
@@ -200,7 +200,7 @@ const tools = await loadTools(catalogPath);
 const advertisedNames = new Set(tools.map((tool) => tool.name));
 
 const server = new Server(
-  { name: "opencodex-codebuddy-capture", version: "1.0.0" },
+  { name: "opencodex-qoder-capture", version: "1.0.0" },
   { capabilities: { tools: {} } },
 );
 

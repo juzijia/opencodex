@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CODEBUDDY_TOOL_LIMITS } from "../../src/adapters/qoder/tool-bridge";
+import { QODER_TOOL_LIMITS } from "../../src/adapters/qoder/tool-bridge";
 
 const tempDirs: string[] = [];
 const serverPath = join(
@@ -109,6 +109,7 @@ describe("Qoder capture-only MCP server", () => {
 
     try {
       await client.connect(transport);
+      expect(client.getServerVersion()?.name).toBe("opencodex-qoder-capture");
       const listed = await client.listTools();
       expect(listed.tools).toEqual([
         {
@@ -155,7 +156,7 @@ describe("Qoder capture-only MCP server", () => {
 
   test("reads at most the catalog limit plus one byte", async () => {
     const stderr = await rejectedCatalog(
-      " ".repeat(CODEBUDDY_TOOL_LIMITS.maxCatalogBytes + 1),
+      " ".repeat(QODER_TOOL_LIMITS.maxCatalogBytes + 1),
     );
     expect(stderr).toContain("tool catalog is too large");
   });
@@ -164,7 +165,7 @@ describe("Qoder capture-only MCP server", () => {
     let deeplyNested: Record<string, unknown> = { type: "object" };
     for (
       let depth = 0;
-      depth <= CODEBUDDY_TOOL_LIMITS.maxSchemaDepth;
+      depth <= QODER_TOOL_LIMITS.maxSchemaDepth;
       depth++
     ) {
       deeplyNested = { type: "object", nested: deeplyNested };
@@ -174,7 +175,7 @@ describe("Qoder capture-only MCP server", () => {
       {
         expected: "too many definitions",
         value: Array.from(
-          { length: CODEBUDDY_TOOL_LIMITS.maxTools + 1 },
+          { length: QODER_TOOL_LIMITS.maxTools + 1 },
           (_, index) => definition(`tool_${index}`),
         ),
       },
@@ -191,7 +192,7 @@ describe("Qoder capture-only MCP server", () => {
         value: [
           definition("description", {
             description: "d".repeat(
-              CODEBUDDY_TOOL_LIMITS.maxDescriptionBytes + 1,
+              QODER_TOOL_LIMITS.maxDescriptionBytes + 1,
             ),
           }),
         ],

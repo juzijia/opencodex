@@ -12,13 +12,13 @@ import {
 } from "../../types";
 import { stripResponsesOnlyEncryptedMarker } from "../responses-tool-schema";
 
-export const CODEBUDDY_MCP_SERVER_NAME = "opencodex";
-export const CODEBUDDY_MCP_TOOL_PREFIX = `mcp__${CODEBUDDY_MCP_SERVER_NAME}__`;
+export const QODER_MCP_SERVER_NAME = "opencodex";
+export const QODER_MCP_TOOL_PREFIX = `mcp__${QODER_MCP_SERVER_NAME}__`;
 
 // These caps protect both the request path and the isolated MCP process. They sit
 // below the adapter's 4 MiB total prompt cap so a maximal tool catalog cannot
 // crowd the transcript and system prompt out of the request budget.
-export const CODEBUDDY_TOOL_LIMITS = Object.freeze({
+export const QODER_TOOL_LIMITS = Object.freeze({
   maxTools: 128,
   // Side-channel v1 accepts exactly one tool call per Qoder invocation.
   // Later calls use Responses continuation and a new stateless invocation.
@@ -33,11 +33,11 @@ export const CODEBUDDY_TOOL_LIMITS = Object.freeze({
   maxPatternBytes: 8 * 1024,
 });
 
-// CodeBuddy renders MCP tools as `mcp__<server>__<tool>`. Keep the complete
+// Qoder renders MCP tools as `mcp__<server>__<tool>`. Keep the complete
 // rendered name comfortably below the common 64-character function-name limit.
-const MAX_CODEBUDDY_TOOL_ALIAS_CHARS = 40;
-const CODEBUDDY_TOOL_ALIAS_HASH_CHARS = 16;
-const CODEBUDDY_TOOL_ALIAS_PATTERN = /^[A-Za-z0-9_-]+$/;
+const MAX_QODER_TOOL_ALIAS_CHARS = 40;
+const QODER_TOOL_ALIAS_HASH_CHARS = 16;
+const QODER_TOOL_ALIAS_PATTERN = /^[A-Za-z0-9_-]+$/;
 const INVALID_TOOL_NAME_PATTERN = /[\s\u0000-\u001f\u007f]/u;
 const INVALID_DESCRIPTION_CONTROL_PATTERN =
   /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
@@ -152,14 +152,14 @@ const KEYWORDS_2020_12_ONLY = new Set([
   "prefixItems",
 ]);
 
-export interface CodeBuddyMcpToolDefinition {
+export interface QoderMcpToolDefinition {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
 }
 
-export interface CodeBuddyToolBridge {
-  tools: CodeBuddyMcpToolDefinition[];
+export interface QoderToolBridge {
+  tools: QoderMcpToolDefinition[];
   /** Exact nested-CLI-emitted MCP name -> Responses wire name. */
   emittedNameMap: Map<string, string>;
   requireToolCall: boolean;
@@ -251,10 +251,10 @@ function cloneBoundedJson(
   depth: number,
   state: JsonCloneState,
 ): JsonValue {
-  if (depth > CODEBUDDY_TOOL_LIMITS.maxSchemaDepth)
+  if (depth > QODER_TOOL_LIMITS.maxSchemaDepth)
     invalidJson("nesting is too deep");
   state.nodes += 1;
-  if (state.nodes > CODEBUDDY_TOOL_LIMITS.maxSchemaNodes)
+  if (state.nodes > QODER_TOOL_LIMITS.maxSchemaNodes)
     invalidJson("node count is too large");
 
   if (
@@ -279,7 +279,7 @@ function cloneBoundedJson(
     if (Array.isArray(value)) {
       if (Object.getPrototypeOf(value) !== Array.prototype)
         invalidJson("arrays must use the built-in prototype");
-      if (value.length > CODEBUDDY_TOOL_LIMITS.maxSchemaNodes)
+      if (value.length > QODER_TOOL_LIMITS.maxSchemaNodes)
         invalidJson("array length is too large");
 
       const keys = Reflect.ownKeys(value);
@@ -379,7 +379,7 @@ function validateSchemaMap(
 function validatePattern(value: unknown, keyword = "pattern"): void {
   if (
     typeof value !== "string" ||
-    utf8Bytes(value) > CODEBUDDY_TOOL_LIMITS.maxPatternBytes
+    utf8Bytes(value) > QODER_TOOL_LIMITS.maxPatternBytes
   ) {
     invalidSchema(`${keyword} must be a bounded regular-expression string`);
   }
@@ -740,9 +740,9 @@ function normalizeInputSchema(
     nodes: 0,
   });
   if (!isRecord(cloned)) invalidSchema("the root must be an object schema");
-  if (serializedBytes(cloned) > CODEBUDDY_TOOL_LIMITS.maxSchemaBytes) {
+  if (serializedBytes(cloned) > QODER_TOOL_LIMITS.maxSchemaBytes) {
     throw new Error(
-      `schema exceeds ${CODEBUDDY_TOOL_LIMITS.maxSchemaBytes} bytes`,
+      `schema exceeds ${QODER_TOOL_LIMITS.maxSchemaBytes} bytes`,
     );
   }
   validateSchema(cloned);
@@ -756,9 +756,9 @@ function normalizeInputSchema(
   if (!isRecord(stripped))
     invalidSchema("the root must remain an object schema");
   if (!Object.hasOwn(stripped, "type")) stripped.type = "object";
-  if (serializedBytes(stripped) > CODEBUDDY_TOOL_LIMITS.maxSchemaBytes) {
+  if (serializedBytes(stripped) > QODER_TOOL_LIMITS.maxSchemaBytes) {
     throw new Error(
-      `schema exceeds ${CODEBUDDY_TOOL_LIMITS.maxSchemaBytes} bytes`,
+      `schema exceeds ${QODER_TOOL_LIMITS.maxSchemaBytes} bytes`,
     );
   }
   return { inputSchema: stripped, dialect };
@@ -768,12 +768,12 @@ function shortHash(value: string, salt = 0): string {
   return createHash("sha256")
     .update(salt === 0 ? value : `${value}\0${salt}`)
     .digest("hex")
-    .slice(0, CODEBUDDY_TOOL_ALIAS_HASH_CHARS);
+    .slice(0, QODER_TOOL_ALIAS_HASH_CHARS);
 }
 
-function directCodeBuddyAlias(wireName: string): string | undefined {
-  return CODEBUDDY_TOOL_ALIAS_PATTERN.test(wireName) &&
-    wireName.length <= MAX_CODEBUDDY_TOOL_ALIAS_CHARS
+function directQoderAlias(wireName: string): string | undefined {
+  return QODER_TOOL_ALIAS_PATTERN.test(wireName) &&
+    wireName.length <= MAX_QODER_TOOL_ALIAS_CHARS
     ? wireName
     : undefined;
 }
@@ -782,11 +782,11 @@ function directCodeBuddyAlias(wireName: string): string | undefined {
  * Produce a deterministic MCP-safe alias while retaining a readable prefix.
  * `used` closes both normalization and truncated-hash collision domains.
  */
-export function codeBuddyToolAlias(
+export function qoderToolAlias(
   wireName: string,
   used = new Set<string>(),
 ): string {
-  const direct = directCodeBuddyAlias(wireName);
+  const direct = directQoderAlias(wireName);
   if (direct && !used.has(direct)) {
     used.add(direct);
     return direct;
@@ -794,9 +794,9 @@ export function codeBuddyToolAlias(
 
   const cleaned = wireName.replace(/[^A-Za-z0-9_-]/g, "_");
   const maxBaseChars =
-    MAX_CODEBUDDY_TOOL_ALIAS_CHARS - CODEBUDDY_TOOL_ALIAS_HASH_CHARS - 1;
+    MAX_QODER_TOOL_ALIAS_CHARS - QODER_TOOL_ALIAS_HASH_CHARS - 1;
   const base = (cleaned || "tool").slice(0, maxBaseChars);
-  for (let salt = 0; salt <= CODEBUDDY_TOOL_LIMITS.maxTools; salt++) {
+  for (let salt = 0; salt <= QODER_TOOL_LIMITS.maxTools; salt++) {
     const candidate = `${base}_${shortHash(wireName, salt)}`;
     if (!used.has(candidate)) {
       used.add(candidate);
@@ -807,13 +807,13 @@ export function codeBuddyToolAlias(
 }
 
 /** Reserve direct names before hashing and sort the rest so request ordering cannot change aliases. */
-function codeBuddyToolAliases(
+function qoderToolAliases(
   wireNames: readonly string[],
 ): Map<string, string> {
   const aliases = new Map<string, string>();
   const used = new Set<string>();
   for (const wireName of wireNames) {
-    const direct = directCodeBuddyAlias(wireName);
+    const direct = directQoderAlias(wireName);
     if (direct) {
       aliases.set(wireName, direct);
       used.add(direct);
@@ -823,7 +823,7 @@ function codeBuddyToolAliases(
     .filter((wireName) => !aliases.has(wireName))
     .sort();
   for (const wireName of hashedNames)
-    aliases.set(wireName, codeBuddyToolAlias(wireName, used));
+    aliases.set(wireName, qoderToolAlias(wireName, used));
   return aliases;
 }
 
@@ -861,9 +861,9 @@ function prepareTool(
     );
   }
   const wireName = namespacedToolName(tool.namespace, tool.name);
-  if (utf8Bytes(wireName) > CODEBUDDY_TOOL_LIMITS.maxNameBytes) {
+  if (utf8Bytes(wireName) > QODER_TOOL_LIMITS.maxNameBytes) {
     throw new Error(
-      `Qoder tool ${index + 1} name exceeds ${CODEBUDDY_TOOL_LIMITS.maxNameBytes} bytes.`,
+      `Qoder tool ${index + 1} name exceeds ${QODER_TOOL_LIMITS.maxNameBytes} bytes.`,
     );
   }
   if (seenWireNames.has(wireName)) {
@@ -881,9 +881,9 @@ function prepareTool(
     throw new Error(`Qoder tool ${index + 1} has an invalid description.`);
   }
   const description = tool.description || `Tool: ${wireName}`;
-  if (utf8Bytes(description) > CODEBUDDY_TOOL_LIMITS.maxDescriptionBytes) {
+  if (utf8Bytes(description) > QODER_TOOL_LIMITS.maxDescriptionBytes) {
     throw new Error(
-      `Qoder tool ${index + 1} description exceeds ${CODEBUDDY_TOOL_LIMITS.maxDescriptionBytes} bytes.`,
+      `Qoder tool ${index + 1} description exceeds ${QODER_TOOL_LIMITS.maxDescriptionBytes} bytes.`,
     );
   }
 
@@ -903,7 +903,7 @@ function prepareTool(
   return { source: tool, wireName, description, inputSchema, dialect };
 }
 
-function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
+function buildToolBridge(parsed: OcxParsedRequest): QoderToolBridge {
   const allTools = parsed.context.tools ?? [];
   if (!Array.isArray(allTools))
     throw new Error("Qoder tool catalog must be an array.");
@@ -944,9 +944,9 @@ function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
       "Qoder tool_choice requires a tool, but no matching tool is available.",
     );
   }
-  if (selected.length > CODEBUDDY_TOOL_LIMITS.maxTools) {
+  if (selected.length > QODER_TOOL_LIMITS.maxTools) {
     throw new Error(
-      `Qoder tool catalog exceeds the ${CODEBUDDY_TOOL_LIMITS.maxTools}-tool limit.`,
+      `Qoder tool catalog exceeds the ${QODER_TOOL_LIMITS.maxTools}-tool limit.`,
     );
   }
 
@@ -954,7 +954,7 @@ function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
   const prepared = selected.map(({ index, tool }) =>
     prepareTool(tool, index, seenWireNames),
   );
-  const aliases = codeBuddyToolAliases(prepared.map((tool) => tool.wireName));
+  const aliases = qoderToolAliases(prepared.map((tool) => tool.wireName));
   // Compile each tool schema with a fresh, request-local AJV instance so no
   // rule set outlives its turn and schemas sharing an `$id` can never bleed
   // constraints into each other (F02).
@@ -974,30 +974,30 @@ function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
     compiledByAlias.set(alias, compiled);
   }
   const definitions = prepared.map(
-    (tool, index): CodeBuddyMcpToolDefinition => {
+    (tool, index): QoderMcpToolDefinition => {
       const definition = {
         name: aliases.get(tool.wireName)!,
         description: tool.description,
         inputSchema: tool.inputSchema,
       };
-      if (serializedBytes(definition) > CODEBUDDY_TOOL_LIMITS.maxToolBytes) {
+      if (serializedBytes(definition) > QODER_TOOL_LIMITS.maxToolBytes) {
         throw new Error(
-          `Qoder tool ${index + 1} definition exceeds ${CODEBUDDY_TOOL_LIMITS.maxToolBytes} bytes.`,
+          `Qoder tool ${index + 1} definition exceeds ${QODER_TOOL_LIMITS.maxToolBytes} bytes.`,
         );
       }
       return definition;
     },
   );
-  if (serializedBytes(definitions) > CODEBUDDY_TOOL_LIMITS.maxCatalogBytes) {
+  if (serializedBytes(definitions) > QODER_TOOL_LIMITS.maxCatalogBytes) {
     throw new Error(
-      `Qoder tool catalog exceeds ${CODEBUDDY_TOOL_LIMITS.maxCatalogBytes} bytes.`,
+      `Qoder tool catalog exceeds ${QODER_TOOL_LIMITS.maxCatalogBytes} bytes.`,
     );
   }
 
   const emittedNameMap = new Map<string, string>();
   const tools = prepared.map((preparedTool, index) => {
     const definition = definitions[index];
-    const emittedName = `${CODEBUDDY_MCP_TOOL_PREFIX}${definition.name}`;
+    const emittedName = `${QODER_MCP_TOOL_PREFIX}${definition.name}`;
     if (emittedNameMap.has(emittedName)) {
       throw new Error(
         "Qoder tool catalog contains a colliding emitted alias.",
@@ -1018,18 +1018,6 @@ function buildToolBridge(parsed: OcxParsedRequest): CodeBuddyToolBridge {
   };
 
   return { tools, emittedNameMap, requireToolCall, validateArguments };
-}
-
-export function buildCodeBuddyToolBridge(
-  parsed: OcxParsedRequest,
-): CodeBuddyToolBridge {
-  return buildToolBridge(parsed);
-}
-
-export function buildCodingAgentToolBridge(
-  parsed: OcxParsedRequest,
-): CodeBuddyToolBridge {
-  return buildToolBridge(parsed);
 }
 
 export { buildToolBridge };

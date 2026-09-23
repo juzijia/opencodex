@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
-  CODEBUDDY_MCP_TOOL_PREFIX as QODER_MCP_TOOL_PREFIX,
-  CODEBUDDY_TOOL_LIMITS as QODER_TOOL_LIMITS,
+  QODER_MCP_TOOL_PREFIX,
+  QODER_TOOL_LIMITS,
   buildToolBridge as buildQoderToolBridge,
-  codeBuddyToolAlias as qoderToolAlias,
+  qoderToolAlias,
 } from "../../src/adapters/qoder/tool-bridge";
 import type { OcxParsedRequest, OcxTool, OcxToolChoice } from "../../src/types";
 
