@@ -754,6 +754,41 @@ describe("Qoder argument validation dialect isolation", () => {
     ).toMatch(/string/);
   });
 
+  test("ignores modern-looking keys inside custom annotation values", () => {
+    const bridge = buildQoderToolBridge(
+      parsed([
+        tool("annotated", {
+          parameters: {
+            type: "object",
+            "x-meta": { dependentRequired: "documentation", prefixItems: [] },
+            properties: { value: { type: "string" } },
+          },
+        }),
+      ]),
+    );
+    expect(bridge.validateArguments("annotated", { value: "ok" })).toBeUndefined();
+    expect(bridge.validateArguments("annotated", { value: 1 })).toMatch(/string/);
+  });
+
+  test("finds 2020-only keywords after a valid 2019 keyword", () => {
+    expect(() =>
+      buildQoderToolBridge(
+        parsed([
+          tool("mixed_dialects", {
+            parameters: {
+              $schema: "https://json-schema.org/draft/2019-09/schema",
+              type: "object",
+              properties: {
+                values: { type: "array", prefixItems: [{ type: "string" }] },
+              },
+              dependentRequired: { values: ["other"] },
+            },
+          }),
+        ]),
+      ),
+    ).toThrow(/prefixItems.*2020-12/);
+  });
+
   test("supports explicit draft-07 without regressions", () => {
     const bridge = buildQoderToolBridge(
       parsed([

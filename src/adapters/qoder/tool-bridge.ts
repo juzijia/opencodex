@@ -591,76 +591,38 @@ interface ModernKeywordHit {
 function modernKeywordHit(
   schema: Record<string, unknown>,
 ): ModernKeywordHit | undefined {
-  // Walk the schema like validateSchema: keyword children that hold schemas by
-  // name stay name bags (properties/patternProperties/$defs/definitions/
-  // dependentSchemas/dependentRequired), literal payload bags stay values
-  // (const/default/enum/examples), and every other object is a schema. This
-  // prevents a property literally named `dependentRequired` from
-  // false-positiving while still catching the keyword anywhere it applies.
+  // Only known subschema positions contain JSON Schema keywords. Unknown
+  // object-valued annotations and literal payloads are data, not schemas.
   interface ScanFrame {
     value: unknown;
     path: string;
-    inNameBag: boolean;
   }
-  const stack: ScanFrame[] = [
-    { value: schema, path: "", inNameBag: false },
-  ];
+  const stack: ScanFrame[] = [{ value: schema, path: "" }];
+  let first2019Hit: ModernKeywordHit | undefined;
   while (stack.length > 0) {
     const frame = stack.pop()!;
     const value = frame.value;
-    if (Array.isArray(value)) {
-      // Array entries are schemas in their own right (allOf/anyOf/oneOf/
-      // prefixItems/items tuples), never name bags.
-      for (let index = value.length - 1; index >= 0; index--) {
-        stack.push({
-          value: value[index],
-          path: `${frame.path}/${index}`,
-          inNameBag: false,
-        });
-      }
-      continue;
-    }
     if (!isRecord(value)) continue;
     for (const [key, child] of Object.entries(value)) {
-      if (frame.inNameBag) {
-        stack.push({ value: child, path: `${frame.path}/${key}`, inNameBag: false });
-        continue;
-      }
       if (KEYWORDS_2019_09_OR_LATER.has(key)) {
-        return { keyword: key, path: `${frame.path}/${key}`, minimumDialect: "2019" };
+        first2019Hit ??= {
+          keyword: key,
+          path: `${frame.path}/${key}`,
+          minimumDialect: "2019",
+        };
       }
       if (KEYWORDS_2020_12_ONLY.has(key)) {
         return { keyword: key, path: `${frame.path}/${key}`, minimumDialect: "2020" };
       }
       if (key === "dependencies") {
-        // A dependency is either a string array or a schema; either way the
-        // child values are not keyword positions themselves.
         if (isRecord(child)) {
           for (const [name, dependency] of Object.entries(child)) {
             stack.push({
               value: dependency,
               path: `${frame.path}/${key}/${name}`,
-              inNameBag: false,
             });
           }
         }
-        continue;
-      }
-      if (key === "items") {
-        if (Array.isArray(child)) {
-          for (let index = child.length - 1; index >= 0; index--) {
-            stack.push({
-              value: child[index],
-              path: `${frame.path}/items/${index}`,
-              inNameBag: false,
-            });
-          }
-        } else {
-          stack.push({ value: child, path: `${frame.path}/items`, inNameBag: false });
-        }
-        continue;
-      }
-      if (key === "const" || key === "default" || key === "enum" || key === "examples") {
         continue;
       }
       if (SCHEMA_MAP_KEYWORDS.includes(key as (typeof SCHEMA_MAP_KEYWORDS)[number])) {
@@ -669,18 +631,39 @@ function modernKeywordHit(
             stack.push({
               value: sub,
               path: `${frame.path}/${key}/${name}`,
-              inNameBag: false,
             });
           }
         }
         continue;
       }
-      if (isRecord(child) || Array.isArray(child)) {
-        stack.push({ value: child, path: `${frame.path}/${key}`, inNameBag: false });
+      if (
+        key === "items" ||
+        SCHEMA_ARRAY_KEYWORDS.includes(
+          key as (typeof SCHEMA_ARRAY_KEYWORDS)[number],
+        )
+      ) {
+        if (Array.isArray(child)) {
+          for (let index = child.length - 1; index >= 0; index--) {
+            stack.push({
+              value: child[index],
+              path: `${frame.path}/${key}/${index}`,
+            });
+          }
+        } else if (key === "items") {
+          stack.push({ value: child, path: `${frame.path}/${key}` });
+        }
+        continue;
+      }
+      if (
+        SCHEMA_VALUE_KEYWORDS.includes(
+          key as (typeof SCHEMA_VALUE_KEYWORDS)[number],
+        )
+      ) {
+        stack.push({ value: child, path: `${frame.path}/${key}` });
       }
     }
   }
-  return undefined;
+  return first2019Hit;
 }
 
 /**
