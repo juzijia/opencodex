@@ -33,8 +33,11 @@ import { requiresPlaintextReasoningReplay } from "../../adapters/openai-response
 /**
  * Adapters whose continuation state must survive Codex's store:false requests.
  */
-export function adapterNeedsForcedContinuation(name: string): boolean {
-  return name === "kiro" || name === "cursor" || name === "qoder";
+export function adapterNeedsForcedContinuation(name: string, response: { output?: unknown }): boolean {
+  if (name === "kiro" || name === "cursor") return true;
+  return name === "qoder" && Array.isArray(response.output) && response.output.some(
+    item => item !== null && typeof item === "object" && (item as { type?: unknown }).type === "function_call",
+  );
 }
 
 

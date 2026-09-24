@@ -432,7 +432,7 @@ export async function executeResponsesRunTurn(
                 parsed._rawBody,
                 response,
                 continuationStateForResponse(providerState),
-                responseStateOptions(adapterNeedsForcedContinuation(transportState.adapter.name)),
+                responseStateOptions(adapterNeedsForcedContinuation(transportState.adapter.name, response)),
               );
             }
             notifyResponseComplete(response);
@@ -499,7 +499,7 @@ export async function executeResponsesRunTurn(
         parsed._rawBody,
         json,
         continuationStateForResponse(providerState),
-        responseStateOptions(adapterNeedsForcedContinuation(transportState.adapter.name)),
+        responseStateOptions(adapterNeedsForcedContinuation(transportState.adapter.name, json)),
       );
     }
     // #1926 gap 2: the buffered path queued its signature persists inside

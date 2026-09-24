@@ -846,13 +846,32 @@ describe("Responses previous_response_id state", () => {
       .toBe("cursor_conv_force_1");
   });
 
-  test("adapterNeedsForcedContinuation covers kiro, cursor, and qoder", () => {
-    expect(adapterNeedsForcedContinuation("kiro")).toBe(true);
-    expect(adapterNeedsForcedContinuation("cursor")).toBe(true);
-    expect(adapterNeedsForcedContinuation("qoder")).toBe(true);
-    expect(adapterNeedsForcedContinuation("openai")).toBe(false);
-    expect(adapterNeedsForcedContinuation("claude")).toBe(false);
-    expect(adapterNeedsForcedContinuation("")).toBe(false);
+  test("Qoder forces continuation only for tool calls; Kiro and Cursor remain unchanged", () => {
+    const text = fixedResponse("resp_qoder_text", [{ type: "message", role: "assistant", content: "hello" }]);
+    const toolCall = fixedResponse("resp_qoder_tool", [
+      { type: "function_call", call_id: "call_qoder_tool", name: "lookup", arguments: "{}" },
+    ]);
+    expect(adapterNeedsForcedContinuation("kiro", text)).toBe(true);
+    expect(adapterNeedsForcedContinuation("cursor", text)).toBe(true);
+    expect(adapterNeedsForcedContinuation("qoder", text)).toBe(false);
+    expect(adapterNeedsForcedContinuation("qoder", toolCall)).toBe(true);
+    expect(adapterNeedsForcedContinuation("openai", toolCall)).toBe(false);
+    expect(adapterNeedsForcedContinuation("claude", toolCall)).toBe(false);
+    expect(adapterNeedsForcedContinuation("", toolCall)).toBe(false);
+
+    const request = { model: "qoder/Qwen3.8-Flash", input: "hello", store: false };
+    rememberResponseState(request, text, undefined, { force: adapterNeedsForcedContinuation("qoder", text) });
+    const textFollowup = { model: request.model, previous_response_id: text.id, input: "next" };
+    expect(expandPreviousResponseInput(textFollowup)).toEqual(textFollowup);
+
+    rememberResponseState(request, toolCall, undefined, { force: adapterNeedsForcedContinuation("qoder", toolCall) });
+    const toolFollowup = {
+      model: request.model,
+      previous_response_id: toolCall.id,
+      input: [{ type: "function_call_output", call_id: "call_qoder_tool", output: "ok" }],
+    };
+    const expanded = expandPreviousResponseInput(toolFollowup) as { input: Array<{ type?: string }> };
+    expect(expanded.input.some(item => item.type === "function_call")).toBe(true);
   });
 
   test("spills the only oversized continuation and leaves resident bytes at or below cap", () => {
