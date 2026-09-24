@@ -15,6 +15,16 @@ import { stripResponsesOnlyEncryptedMarker } from "../responses-tool-schema";
 export const QODER_MCP_SERVER_NAME = "opencodex";
 export const QODER_MCP_TOOL_PREFIX = `mcp__${QODER_MCP_SERVER_NAME}__`;
 
+export const MAX_CAPTURE_BYTES = 256 * 1024;
+export interface ToolBridgeCapturePayload {
+  version: 1;
+  nonce: string;
+  sequence: number;
+  name: string;
+  arguments: Record<string, unknown>;
+  error?: "tool_call_limit" | "invalid_tool_arguments";
+}
+
 // These caps protect both the request path and the isolated MCP process. They sit
 // below the adapter's 4 MiB total prompt cap so a maximal tool catalog cannot
 // crowd the transcript and system prompt out of the request budget.

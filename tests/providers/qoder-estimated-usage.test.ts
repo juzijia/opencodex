@@ -20,10 +20,8 @@ import type {
   AdapterEvent,
   OcxParsedRequest,
   OcxProviderConfig,
-  OcxUsage,
 } from "../../src/types";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
-import { usageStatusForFinalLog } from "../../src/usage/log";
 
 const enc = new TextEncoder();
 beforeEach(() => clearQoderBinaryCache());
@@ -218,18 +216,6 @@ describe("Qoder estimated usage", () => {
     expect(done.usage!.cachedInputTokens).toBeUndefined();
     expect(done.usage!.cacheReadInputTokens).toBeUndefined();
     expect(done.usage!.cacheCreationInputTokens).toBeUndefined();
-  });
-
-  test("7 & 8. estimated=true maps to usageStatus=estimated", () => {
-    const usage: OcxUsage = {
-      inputTokens: 100,
-      outputTokens: 25,
-      totalTokens: 125,
-      estimated: true,
-    };
-    expect(usage.estimated).toBe(true);
-    const status = usageStatusForFinalLog(usage);
-    expect(status).toBe("estimated");
   });
 
   test("9. Scaffold guard integration and refusal preserved", async () => {

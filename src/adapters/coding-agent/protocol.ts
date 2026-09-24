@@ -221,25 +221,8 @@ export interface StreamParseState {
   partialToolCallIds?: Set<string>;
   /** A complete assistant tool block had no matching partial capture. */
   uncapturedToolUse?: boolean;
-  /** Qoder can emit a tool_use only in a complete assistant frame. */
-  allowCompleteToolCalls?: boolean;
-  /** Tool IDs already seen in either partial or complete frames. */
-  seenToolCallIds?: Set<string>;
   /** Highest-seen usage snapshot from `message_delta`/assistant frames before a terminal result. */
   partialUsage?: OcxUsage;
-}
-
-/** Shared wire contract for a capture-only MCP bridge side channel. */
-export const MAX_CAPTURE_BYTES = 256 * 1024;
-
-export interface ToolBridgeCapturePayload {
-  version: 1;
-  nonce: string;
-  sequence: number;
-  name: string;
-  arguments: Record<string, unknown>;
-  /** Bounded helper failure; no oversized argument content is copied into the record. */
-  error?: "tool_call_limit";
 }
 
 /**
@@ -277,23 +260,7 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
           if (thinking) events.push({ type: "thinking_delta", thinking });
         } else if (blockType === "tool_use") {
           const id = asString(part.id);
-          if (state.allowCompleteToolCalls) {
-            const name = asString(part.name);
-            if (!id || !name) continue;
-            if (state.seenToolCallIds?.has(id)) {
-              if (state.openToolCallId === id) {
-                state.openToolCallId = undefined;
-                state.completedToolCalls = (state.completedToolCalls ?? 0) + 1;
-                events.push({ type: "tool_call_end" });
-              }
-              continue;
-            }
-            (state.seenToolCallIds ??= new Set()).add(id);
-            state.completedToolCalls = (state.completedToolCalls ?? 0) + 1;
-            events.push({ type: "tool_call_start", id, name }, { type: "tool_call_end" });
-          } else if (!id || !state.partialToolCallIds?.has(id)) {
-            state.uncapturedToolUse = true;
-          }
+          if (!id || !state.partialToolCallIds?.has(id)) state.uncapturedToolUse = true;
         }
       }
     }
@@ -309,38 +276,29 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
         ? message.errors.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
         : [];
       const detail = asString(message.result) || errors[0] || "Coding-agent CLI ended the turn with an execution error";
-      const vendorCode = typeof message.error_code === "number" ? message.error_code : undefined;
-      // Qoder documents code 118 and emits the "credit usage limit" wording. Keep the
-      // match deliberately narrow so other coding-agent CLIs retain their established
-      // generic-upstream handling for ambiguous text such as "insufficient credits".
-      const insufficientQuota = vendorCode === 118 || /credit usage limit/i.test(detail);
       // Anchor to credential verdicts. A bare "authentication" substring also matches upstream
       // service-degradation text, and a false 401 drives reauth messaging and key-pool rotation.
       const authentication = /not logged in|invalid (?:personal access )?token|authentication (?:failed|error|required)|unauthorized/i.test(detail);
-      const rateLimited = !insufficientQuota && /rate limit|too many requests/i.test(detail);
+      const rateLimited = /rate limit|too many requests/i.test(detail);
       const modelUnavailable = /model (?:is )?(?:not found|unavailable|unsupported)|invalid model/i.test(detail);
       events.push({
         type: "error",
         message: detail,
-        status: insufficientQuota || rateLimited ? 429 : authentication ? 401 : modelUnavailable ? 400 : 502,
-        errorType: insufficientQuota
-          ? "insufficient_quota"
-          : rateLimited
-            ? "rate_limit_error"
-            : authentication
-              ? "authentication_error"
-              : modelUnavailable
-                ? "invalid_request_error"
-                : "upstream_error",
-        code: insufficientQuota
-          ? "insufficient_quota"
-          : rateLimited
-            ? "rate_limit_exceeded"
-            : authentication
-              ? "invalid_api_key"
-              : modelUnavailable
-                ? "model_not_found"
-                : "upstream_error",
+        status: rateLimited ? 429 : authentication ? 401 : modelUnavailable ? 400 : 502,
+        errorType: rateLimited
+          ? "rate_limit_error"
+          : authentication
+            ? "authentication_error"
+            : modelUnavailable
+              ? "invalid_request_error"
+              : "upstream_error",
+        code: rateLimited
+          ? "rate_limit_exceeded"
+          : authentication
+            ? "invalid_api_key"
+            : modelUnavailable
+              ? "model_not_found"
+              : "upstream_error",
         retryable: rateLimited,
         ...(usage ? { usage } : {}),
       });
@@ -393,7 +351,6 @@ function mapRawStreamEvent(event: StreamMessage, state: StreamParseState): Adapt
       if (id) {
         state.openToolCallId = id;
         state.partialToolCallIds?.add(id);
-        (state.seenToolCallIds ??= new Set()).add(id);
         events.push({ type: "tool_call_start", id, name });
       }
     }

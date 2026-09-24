@@ -111,6 +111,42 @@ describe("Qoder capture-only MCP server", () => {
     }
   });
 
+  test("pathological schema patterns are rejected in the isolated helper without blocking the parent", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "opencodex-qoder-mcp-pattern-"));
+    tempDirs.push(dir);
+    const catalogPath = join(dir, "tools.json");
+    writeFileSync(catalogPath, JSON.stringify([definition("lookup", {
+      inputSchema: { type: "object", properties: {
+        values: { type: "array", items: { type: "string", pattern: "^(a+)+$" } },
+      }, required: ["values"] },
+    })]), { mode: 0o600 });
+    const client = new Client({ name: "qoder-pattern-test", version: "1" });
+    const transport = new StdioClientTransport({
+      command: process.execPath, args: [serverPath, catalogPath], stderr: "pipe",
+      env: { OCX_MCP_CAPTURE_DIR: dir, OCX_MCP_CAPTURE_NONCE: "test-nonce" },
+    });
+    const abort = new AbortController();
+    try {
+      await client.connect(transport);
+      const started = performance.now();
+      const tick = new Promise<number>(resolve => setTimeout(() => resolve(performance.now() - started), 20));
+      const pending = client.callTool({ name: "lookup", arguments: {
+        values: Array(4).fill("a".repeat(30) + "!"),
+      } }, undefined, { signal: abort.signal });
+      void pending.catch(() => {});
+      expect(await tick).toBeLessThan(250);
+      const capture = join(dir, "capture-1.json");
+      for (let i = 0; i < 300 && !existsSync(capture); i++) await Bun.sleep(5);
+      expect(existsSync(capture)).toBe(true);
+      expect(JSON.parse(readFileSync(capture, "utf8"))).toMatchObject({
+        version: 1, nonce: "test-nonce", error: "invalid_tool_arguments",
+      });
+    } finally {
+      abort.abort();
+      await client.close();
+    }
+  });
+
   test("advertises only the private catalog, rejects unknown tools, and never executes known tools", async () => {
     const dir = mkdtempSync(join(tmpdir(), "opencodex-qoder-mcp-test-"));
     tempDirs.push(dir);
