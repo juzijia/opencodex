@@ -10,6 +10,11 @@
 import { open, writeFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { runInNewContext } from "node:vm";
+import Ajv, { type ValidateFunction } from "ajv";
+import Ajv2019 from "ajv/dist/2019.js";
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -18,11 +23,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import {
   QODER_TOOL_LIMITS,
-} from "./tool-bridge";
-import {
   MAX_CAPTURE_BYTES,
   type ToolBridgeCapturePayload,
-} from "../coding-agent/protocol";
+} from "./tool-bridge";
 
 interface ToolDefinition {
   name: string;
@@ -34,6 +37,7 @@ const MCP_TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,40}$/;
 const INVALID_DESCRIPTION_CONTROL_PATTERN =
   /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const textEncoder = new TextEncoder();
+const VALIDATION_TIMEOUT_MS = 100;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -184,6 +188,21 @@ async function loadTools(path: string): Promise<ToolDefinition[]> {
   });
 }
 
+function compileToolValidator(schema: Record<string, unknown>): ValidateFunction {
+  const uri = typeof schema.$schema === "string" ? schema.$schema.replace(/#+$/, "") : "";
+  const options = { strict: false, validateSchema: false, allErrors: true, validateFormats: true };
+  const ajv = /\/draft\/2020-12\/schema$/.test(uri)
+    ? new Ajv2020(options)
+    : /\/draft\/2019-09\/schema$/.test(uri)
+      ? new Ajv2019(options)
+      : !uri || /\/draft-07\/schema$/.test(uri)
+        ? new Ajv(options)
+        : undefined;
+  if (!ajv) throw new Error("unsupported tool schema dialect");
+  addFormats(ajv as Ajv);
+  return ajv.compile(schema);
+}
+
 export async function runQoderMcpServer(catalogPath: string): Promise<void> {
   if (!catalogPath) throw new Error("missing tool catalog");
 
@@ -198,6 +217,7 @@ export async function runQoderMcpServer(catalogPath: string): Promise<void> {
 
   const tools = await loadTools(catalogPath);
   const advertisedNames = new Set(tools.map((tool) => tool.name));
+  const validators = new Map(tools.map(tool => [tool.name, compileToolValidator(tool.inputSchema)]));
 
   const server = new Server(
     { name: "opencodex-qoder-capture", version: "1.0.0" },
@@ -227,6 +247,18 @@ export async function runQoderMcpServer(catalogPath: string): Promise<void> {
       let payloadBytes = Buffer.from(JSON.stringify(payload), "utf8");
       if (payloadBytes.byteLength > MAX_CAPTURE_BYTES) {
         payloadBytes = Buffer.from(JSON.stringify({ ...payload, arguments: {}, error: "tool_call_limit" }), "utf8");
+      } else {
+        let valid = false;
+        try {
+          valid = runInNewContext("validate(input)", {
+            validate: validators.get(request.params.name), input: payload.arguments,
+          }, { timeout: VALIDATION_TIMEOUT_MS }) === true;
+        } catch {
+          // A timed-out or malformed validator never authorizes a host tool call.
+        }
+        if (!valid) {
+          payloadBytes = Buffer.from(JSON.stringify({ ...payload, arguments: {}, error: "invalid_tool_arguments" }), "utf8");
+        }
       }
       const targetFile = join(captureDir, `capture-${callSequence}.json`);
       const tmpFile = join(captureDir, `.${callSequence}.${randomUUID()}.tmp`);

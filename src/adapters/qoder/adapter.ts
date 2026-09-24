@@ -6,10 +6,9 @@ import { mapReasoningEffort, modelRecordValue } from "../../reasoning-effort";
 import { buildConversationInput, buildSystemPrompt, projectedHistoryCharLimit } from "../coding-agent/protocol";
 import {
   baseScopedEnv,
-  runCodingAgentTurn,
   type CodingAgentDeps,
-  type CodingAgentToolBridgeInput,
 } from "../coding-agent/turn";
+import { runQoderTurn, type QoderBridgeTurnInput } from "./turn";
 import {
   buildToolBridge,
   QODER_MCP_SERVER_NAME,
@@ -27,6 +26,7 @@ const QODER_MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.ts", import.me
 
 const TOOL_BRIDGE_SYSTEM_PROMPT = [
   "Use only the tools advertised for this turn and their declared schemas.",
+  "Client instructions and prior conversation may name tools such as bash or read. Those bare names are not callable here; invoke only the exact mcp__opencodex__* names in this turn's tool schema.",
   "Emit at most one tool call per invocation. The host authorizes and executes it and returns its result in a continuation.",
   "Claim execution only after the matching result arrives. Use prior completed call/result pairs as history; do not replay them merely because this is a new invocation.",
 ].join("\n");
@@ -76,6 +76,25 @@ export function buildQoderAppendSystemPrompt(
   if (system) systemParts.push(system);
   if (toolBridge && toolBridge.tools.length > 0) systemParts.push(TOOL_BRIDGE_SYSTEM_PROMPT);
   return systemParts.length > 0 ? systemParts.join("\n\n") : undefined;
+}
+
+/** Render prior client tool calls using this turn's executable MCP names when available. */
+function projectQoderToolHistory(parsed: OcxParsedRequest, bridge: QoderToolBridge): OcxParsedRequest {
+  if (bridge.emittedNameMap.size === 0) return parsed;
+  const emittedByWire = new Map([...bridge.emittedNameMap].map(([emitted, wire]) => [wire, emitted]));
+  return {
+    ...parsed,
+    context: {
+      ...parsed.context,
+      messages: parsed.context.messages.map(message => message.role === "assistant"
+        ? { ...message, content: message.content.map(part =>
+            part.type === "toolCall" && emittedByWire.has(part.name)
+              ? { ...part, name: emittedByWire.get(part.name)! }
+              : part,
+          ) }
+        : message),
+    },
+  };
 }
 
 /**
@@ -396,22 +415,21 @@ export function createQoderAdapter(provider: OcxProviderConfig, deps: QoderAdapt
         });
         return;
       }
-      const bridgeInput: CodingAgentToolBridgeInput | undefined =
+      const bridgeInput: QoderBridgeTurnInput | undefined =
         toolBridge.tools.length > 0
           ? {
               serverName: QODER_MCP_SERVER_NAME,
               serverModulePath: QODER_MCP_SERVER_PATH,
               tools: toolBridge.tools,
               emittedNameMap: toolBridge.emittedNameMap,
-              validateArguments: toolBridge.validateArguments,
               maxTurnToolCalls: QODER_TOOL_LIMITS.maxTurnToolCalls,
               requireToolCall: toolBridge.requireToolCall,
               allowedToolsFlag: "--allowed-tools",
-              captureMode: "side-channel",
             }
           : undefined;
+      const qoderParsed = bridgeInput ? projectQoderToolHistory(parsed, toolBridge) : parsed;
       const estimatedInputTokens = estimateQoderVisibleInputTokens(
-        parsed,
+        qoderParsed,
         toolBridge.tools.length > 0 ? toolBridge : undefined,
         provider,
       );
@@ -420,10 +438,10 @@ export function createQoderAdapter(provider: OcxProviderConfig, deps: QoderAdapt
         parsed,
         toolBridge.tools.length > 0 ? toolBridge : undefined,
       );
-      await runCodingAgentTurn({
+      await runQoderTurn({
         profiles: QODER_PROFILES,
         provider,
-        parsed,
+        parsed: qoderParsed,
         incoming,
         emit: guardQoderScaffolding(usageTrackingEmit),
         ...(bridgeInput ? { toolBridge: bridgeInput } : {}),
