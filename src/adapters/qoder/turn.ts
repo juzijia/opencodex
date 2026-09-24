@@ -388,6 +388,7 @@ async function consumeQoderFrames(
       }
       const assistantInputs = new Map<string, { name: string; input: NativeInput }>();
       if (toolBridge && message.type === "assistant") {
+        let assistantToolUseCount = 0;
         const assistant = message.message;
         const blocks = assistant && typeof assistant === "object" && !Array.isArray(assistant)
           ? (assistant as Record<string, unknown>).content
@@ -396,17 +397,23 @@ async function consumeQoderFrames(
           for (const block of blocks) {
             if (block && typeof block === "object" && !Array.isArray(block)) {
               const item = block as Record<string, unknown>;
-              if (item.type === "tool_use" && typeof item.id === "string" && item.id) {
-                if (assistantInputs.has(item.id)) {
-                  throw new CodingAgentProtocolError("Coding-agent CLI repeated a native tool ID within one assistant message.");
+              if (item.type === "tool_use") {
+                assistantToolUseCount += 1;
+                if (typeof item.id === "string" && item.id) {
+                  if (assistantInputs.has(item.id)) {
+                    throw new CodingAgentProtocolError("Coding-agent CLI repeated a native tool ID within one assistant message.");
+                  }
+                  assistantInputs.set(item.id, {
+                    name: typeof item.name === "string" ? item.name : "",
+                    input: nativeInput(item),
+                  });
                 }
-                assistantInputs.set(item.id, {
-                  name: typeof item.name === "string" ? item.name : "",
-                  input: nativeInput(item),
-                });
               }
             }
           }
+        }
+        if (assistantToolUseCount > 1) {
+          throw new CodingAgentProtocolError("Coding-agent CLI returned multiple native tool calls in one assistant message.");
         }
         if (nativeToolCall && assistantInputs.has(nativeToolCall.id)) {
           const complete = assistantInputs.get(nativeToolCall.id)!;
@@ -454,15 +461,12 @@ async function consumeQoderFrames(
             break;
           }
           toolCallStarts += 1;
-          if (toolCallStarts > MAX_SIDE_CHANNEL_CALLS) {
-            emitOnce({ type: "error", message: "Coding-agent CLI returned too many tool calls in one invocation.", status: 502, errorType: "upstream_error", code: "tool_call_limit", retryable: false });
+          if (toolCallStarts > 1) {
+            emitOnce({ type: "error", message: "Coding-agent CLI returned multiple native tool calls in one invocation.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
             failClosed = true;
             kill();
             break;
           }
-          // The host executes one call, then continues in a new invocation. Ignore
-          // any extra native identities; their capture-only MCP calls never execute.
-          if (toolCallStarts > 1) continue;
           const wireName = toolBridge.emittedNameMap.get(event.name);
           if (wireName === undefined) {
             emitOnce({ type: "error", message: "Coding-agent CLI called a tool outside the isolated catalog.", status: 502, errorType: "upstream_error", code: "undeclared_tool_call", retryable: false });

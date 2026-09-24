@@ -384,7 +384,7 @@ export async function executeResponsesSidecars(
           parsed._rawBody,
           response,
           continuationStateForResponse(providerState),
-          responseStateOptions(adapterNeedsForcedContinuation(transportState.adapter.name)),
+          responseStateOptions(adapterNeedsForcedContinuation(transportState.adapter.name, response)),
         );
         notifyResponseComplete(response);
       },
