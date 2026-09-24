@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { buildQoderAppendSystemPrompt, buildQoderArgs, buildQoderChildEnv, createQoderAdapter } from "../../src/adapters/qoder/adapter";
@@ -37,12 +38,43 @@ describe("qoder adapter", () => {
     const result = buildQoderAppendSystemPrompt(request, { tools: [{ name: "shell", description: "run a command", inputSchema: {} }] });
     expect(result!.startsWith("caller system prompt")).toBe(true);
     expect(result).toContain("Use only the tools advertised for this turn");
+    expect(result).toContain("bare names are not callable here");
+    expect(result).toContain("mcp__opencodex__*");
     expect(result).toContain("host authorizes and executes it");
     expect(result).toContain("at most one tool call per invocation");
     expect(result).toContain("after the matching result arrives");
     expect(result).not.toContain("Your built-in tools and user-configured MCP servers are disabled");
     expect(result).not.toContain("never executes a tool");
     expect(result).not.toContain("external Codex client");
+  });
+
+  test("projects Pi's prior tool call to the executable Qoder MCP name", async () => {
+    const previousCall = { type: "toolCall" as const, id: "call_1", name: "bash", arguments: { command: "pwd" } };
+    const request = parsed({ context: {
+      systemPrompt: ["- bash: Execute bash commands"],
+      tools: [{ name: "bash", description: "run a command", parameters: { type: "object", properties: { command: { type: "string" } } } }],
+      messages: [
+        { role: "user", content: "check", timestamp: 0 },
+        { role: "assistant", content: [previousCall], timestamp: 1 },
+        { role: "user", content: "continue", timestamp: 2 },
+      ],
+    } });
+    let stdin = "";
+    let prompt = "";
+    const adapter = createQoderAdapter(provider(), {
+      which: () => "/bin/qoder",
+      spawn: (_command, args) => {
+        prompt = readFileSync(args[args.indexOf("--append-system-prompt-file") + 1]!, "utf8");
+        const child = fakeChild(['{"type":"result","subtype":"success","is_error":false}\n']);
+        child.stdin = new Writable({ write(chunk, _encoding, callback) { stdin += chunk.toString(); callback(); } });
+        return child;
+      },
+    });
+    await adapter.runTurn!(request, { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, () => {});
+    expect(prompt).toContain("bare names are not callable here");
+    expect(stdin).toContain("Tool call: mcp__opencodex__bash");
+    expect(stdin).not.toContain("Tool call: bash");
+    expect(previousCall.name).toBe("bash");
   });
 
   test("does not append the tool bridge contract when no tools are bridged", () => {
@@ -101,6 +133,7 @@ describe("qoder adapter", () => {
     expect(promptContents).toBe(`${secretSystem}\n\n${secretDeveloper}`);
     expect(childEnv.QODER_APPEND_SYSTEM_PROMPT).toBeUndefined();
     expect(existsSync(promptPath)).toBe(false);
+    expect(existsSync(dirname(promptPath))).toBe(false);
   });
 
   test("never inherits an ambient Qoder prompt for either region", () => {

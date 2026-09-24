@@ -10,15 +10,16 @@ forged GUI headers and raw management credentials do not substitute for it. Dire
 and other OAuth providers retain their existing policies. `src/oauth/meta-muse-device.ts`
 cancels unparsed authorization/mint failures, including mint429, without reflecting their bodies.
 
-The capture-only bridge in `src/adapters/coding-agent/turn.ts` reports staging failures with
-the fixed `tool_bridge_setup_failed` error, never an OS error carrying private file paths.
-Failure prevents CLI spawn and settles the bridge's private directory; the CodeBuddy adapter
-also settles its prompt-file directory. Catalog and MCP-config write failures cover both owners.
-In a compiled executable, the bridge launches the private `__codebuddy-mcp` or
-`__qoder-mcp` CLI entrypoint; source execution launches the corresponding MCP module with
-Bun. Both paths advertise only the request's isolated catalog and leave tool execution to
-the external client. Qoder appends the folded system prompt through a private 0600 file,
-passed with `--append-system-prompt-file` and removed after the turn.
+`src/adapters/coding-agent/turn.ts` owns the scoped CLI process, stdin/raw stdout, timeout,
+abort/reap, and private MCP catalog/config staging. Staging failure reports the fixed
+`tool_bridge_setup_failed` error without OS paths, prevents spawn, and removes the directory.
+CodeBuddy consumes those frames through `runCodingAgentTurn` and stages its own prompt file.
+`src/adapters/qoder/turn.ts` consumes the same raw process frames but owns its prompt file,
+capture nonce/records, tool-input pairing, and side-channel terminal decision. Its private
+0600 prompt file is passed with `--append-system-prompt-file` and removed after the turn.
+Compiled bridges launch `__codebuddy-mcp` or `__qoder-mcp`; source execution launches the
+corresponding MCP module with Bun. Both advertise only the isolated request catalog and
+leave tool execution to the external client.
 
 Kimi Coding's Chat, API-key, and optional Responses presets consume the same model seeds in
 `src/providers/registry/model-seeds.ts`, including the native `k3-256k` ID. The Responses preset
