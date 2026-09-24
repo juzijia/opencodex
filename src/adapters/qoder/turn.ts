@@ -90,12 +90,9 @@ async function consumeQoderFrames(
   let watcher: FSWatcher | undefined;
   let sideChannelPollTimer: ReturnType<typeof setInterval> | undefined;
   let captureMatchTimer: ReturnType<typeof setTimeout> | undefined;
-  let messageSettlementTimer: ReturnType<typeof setTimeout> | undefined;
   const stopSideChannel = (): void => {
     if (captureMatchTimer) clearTimeout(captureMatchTimer);
     captureMatchTimer = undefined;
-    if (messageSettlementTimer) clearTimeout(messageSettlementTimer);
-    messageSettlementTimer = undefined;
     if (watcher) {
       try {
         watcher.close();
@@ -540,16 +537,6 @@ async function consumeQoderFrames(
         if (state.sawMessageStop) await checkSideChannel();
         commitSideChannelCapture();
         if (captureCommitted) break;
-        if (nativeToolCall?.complete && (!completeAssistantSeen || capturedToolCalls.length === 0) && !messageSettlementTimer) {
-          messageSettlementTimer = setTimeout(() => {
-            if (captureCommitted || isTerminal() || streamEnded || (completeAssistantSeen && capturedToolCalls.length > 0)) return;
-            captureCommitted = true;
-            stopSideChannel();
-            emitOnce({ type: "error", message: "Coding-agent CLI did not settle the native tool call with a complete assistant, result, or EOF.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
-            kill();
-            stopStream();
-          }, CAPTURE_MATCH_WAIT_MS);
-        }
       }
       if (failClosed) break;
       if (

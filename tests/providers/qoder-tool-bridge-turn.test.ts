@@ -787,6 +787,28 @@ describe("Qoder side-channel capture", () => {
     expectSingleCapturedCall(events, "tu_first_1", wireName);
   });
 
+  test("a matching capture survives a complete assistant arriving after the old one-second settlement gate", async () => {
+    const { p, cliName, wireName, alias } = sideChannelCase();
+    const spawn: SpawnFn = (_cmd, args) => {
+      const { captureDir, nonce } = captureConfig(args);
+      writeCaptureFile(captureDir, nonce, 1, alias, { a: 1 });
+      const { child, push } = manualChild();
+      push(INIT_OK);
+      push(toolUseStart(cliName, "tu_delayed_assistant"));
+      push(inputJsonDelta('{"a":1}'));
+      push(BLOCK_STOP);
+      setTimeout(() => {
+        push({ type: "assistant", message: { role: "assistant", content: [
+          { type: "tool_use", id: "tu_delayed_assistant", name: cliName, input: { a: 1 } },
+        ] } });
+        push(MESSAGE_STOP);
+      }, 1_300);
+      return child as unknown as ChildProcess;
+    };
+    const adapter = createQoderAdapter(provider(), { spawn, which: () => "/usr/bin/qoder" });
+    expectSingleCapturedCall(await run(adapter, p), "tu_delayed_assistant", wireName);
+  });
+
   test("parallel CLI calls fail closed instead of publishing the first tool", async () => {
     const { p, cliName, alias } = sideChannelCase();
     const spawn: SpawnFn = (_cmd, args) => {
