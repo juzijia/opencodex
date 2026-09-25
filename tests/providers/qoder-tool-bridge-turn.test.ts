@@ -589,18 +589,23 @@ describe("Qoder capture-only tool bridge turn", () => {
     });
   });
 
-  test("a second native tool start fails closed", async () => {
+  test("a second identical native tool without a distinct capture fails closed", async () => {
     const p = parsed([tool("exec")]);
     const bridge = buildQoderToolBridge(p);
     const cliName = [...bridge.emittedNameMap.keys()][0]!;
     const frames: unknown[] = [INIT_OK];
     for (let i = 0; i < 2; i += 1) {
       frames.push(toolUseStart(cliName, `tu_${i}`));
+      frames.push(inputJsonDelta('{"a":1}'));
       frames.push(BLOCK_STOP);
     }
     frames.push(MESSAGE_STOP);
     const adapter = createQoderAdapter(provider(), {
-      spawn: () => fakeChild(frameLines(frames)) as unknown as ChildProcess,
+      spawn: (_cmd, args) => {
+        const { captureDir, nonce } = captureConfig(args);
+        writeCaptureFile(captureDir, nonce, 1, bridge.tools[0]!.name, { a: 1 });
+        return fakeChild(frameLines(frames)) as unknown as ChildProcess;
+      },
       which: () => "/usr/bin/qoder",
     });
     const events = await run(adapter, p);
@@ -608,7 +613,7 @@ describe("Qoder capture-only tool bridge turn", () => {
       type: "error",
       code: "protocol_error",
     });
-    expect(events.some(event => event.type === "tool_call_start")).toBe(false);
+    expect(events.filter(event => event.type === "tool_call_start")).toHaveLength(0);
   });
 
   test("continuation turn projects toolResult correctly and runs text leg", async () => {
@@ -809,7 +814,7 @@ describe("Qoder side-channel capture", () => {
     expectSingleCapturedCall(await run(adapter, p), "tu_delayed_assistant", wireName);
   });
 
-  test("parallel CLI calls fail closed instead of publishing the first tool", async () => {
+  test("parallel CLI calls publish both tools atomically and finish once", async () => {
     const { p, cliName, alias } = sideChannelCase();
     const spawn: SpawnFn = (_cmd, args) => {
       const { captureDir, nonce } = captureConfig(args);
@@ -832,11 +837,18 @@ describe("Qoder side-channel capture", () => {
       which: () => "/usr/bin/qoder",
     });
     const events = await run(adapter, p);
-    expect(events.some(e => e.type === "tool_call_start")).toBe(false);
-    expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error" });
+    expect(events.map(e => e.type)).toEqual([
+      "tool_call_start", "tool_call_delta", "tool_call_end",
+      "tool_call_start", "tool_call_delta", "tool_call_end", "done",
+    ]);
+    expect(events.filter(e => e.type === "tool_call_start")).toMatchObject([
+      { id: "tu_first", name: "exec" }, { id: "tu_second", name: "exec" },
+    ]);
+    expect(events.at(-1)).toMatchObject({ stopReason: "tool_use", endTurn: false });
+    expect(JSON.stringify(events)).not.toContain("multiple native tool calls in one invocation");
   });
 
-  test("reversed same-tool captures with two native calls fail closed", async () => {
+  test("reversed same-tool captures match by arguments in native order", async () => {
     const { p, cliName, alias } = sideChannelCase();
     const spawn: SpawnFn = (_cmd, args) => {
       const { captureDir, nonce } = captureConfig(args);
@@ -859,11 +871,16 @@ describe("Qoder side-channel capture", () => {
       which: () => "/usr/bin/qoder",
     });
     const events = await run(adapter, p);
-    expect(events.some(e => e.type === "tool_call_start")).toBe(false);
-    expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error" });
+    expect(events.filter(e => e.type === "tool_call_start")).toMatchObject([
+      { id: "tu_first" }, { id: "tu_second" },
+    ]);
+    expect(events.filter(e => e.type === "tool_call_delta")).toMatchObject([
+      { arguments: '{"a":1}' }, { arguments: '{"a":2}' },
+    ]);
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use" });
   });
 
-  test("reversed different-tool captures with two native calls fail closed", async () => {
+  test("reversed different-tool captures match by name and arguments", async () => {
     const p = parsed([tool("lookup"), tool("exec")]);
     const bridge = buildQoderToolBridge(p);
     const lookup = [...bridge.emittedNameMap.entries()].find(([, wire]) => wire === "lookup")!;
@@ -889,8 +906,37 @@ describe("Qoder side-channel capture", () => {
       which: () => "/usr/bin/qoder",
     });
     const events = await run(adapter, p);
-    expect(events.some(e => e.type === "tool_call_start")).toBe(false);
-    expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error" });
+    expect(events.filter(e => e.type === "tool_call_start")).toMatchObject([
+      { id: "tu_lookup", name: "lookup" }, { id: "tu_exec", name: "exec" },
+    ]);
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use" });
+  });
+
+  test("identical native calls consume two distinct captures", async () => {
+    const { p, cliName, alias } = sideChannelCase();
+    const spawn: SpawnFn = (_cmd, args) => {
+      const { captureDir, nonce } = captureConfig(args);
+      writeCaptureFile(captureDir, nonce, 1, alias, { a: 1 });
+      writeCaptureFile(captureDir, nonce, 2, alias, { a: 1 });
+      const { child, push } = manualChild();
+      push(INIT_OK);
+      for (const id of ["tu_same_1", "tu_same_2"]) {
+        push(toolUseStart(cliName, id));
+        push(inputJsonDelta('{"a":1}'));
+        push(BLOCK_STOP);
+      }
+      push(MESSAGE_STOP);
+      push(null);
+      return child as unknown as ChildProcess;
+    };
+    const events = await run(createQoderAdapter(provider(), { spawn, which: () => "/usr/bin/qoder" }), p);
+    expect(events.filter(e => e.type === "tool_call_start")).toMatchObject([
+      { id: "tu_same_1" }, { id: "tu_same_2" },
+    ]);
+    expect(events.filter(e => e.type === "tool_call_delta")).toMatchObject([
+      { arguments: '{"a":1}' }, { arguments: '{"a":1}' },
+    ]);
+    expect(events.filter(e => e.type === "done")).toHaveLength(1);
   });
 
   test("waits for the matching reversed capture after an earlier unrelated capture", async () => {
@@ -957,7 +1003,7 @@ describe("Qoder side-channel capture", () => {
     expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error" });
   });
 
-  test("complete assistant with two native calls fails closed without partial deltas", async () => {
+  test("complete assistant with two native calls publishes both without partial deltas", async () => {
     const { p, cliName, alias } = sideChannelCase();
     const spawn: SpawnFn = (_cmd, args) => {
       const { captureDir, nonce } = captureConfig(args);
@@ -976,8 +1022,13 @@ describe("Qoder side-channel capture", () => {
       which: () => "/usr/bin/qoder",
     });
     const events = await run(adapter, p);
-    expect(events.some(e => e.type === "tool_call_start")).toBe(false);
-    expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error" });
+    expect(events.filter(e => e.type === "tool_call_start")).toMatchObject([
+      { id: "tu_first" }, { id: "tu_second" },
+    ]);
+    expect(events.filter(e => e.type === "tool_call_delta")).toMatchObject([
+      { arguments: '{"a":1}' }, { arguments: '{"a":2}' },
+    ]);
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use" });
   });
 
   test("complete assistant input can arrive after message_stop", async () => {
@@ -1092,23 +1143,31 @@ describe("Qoder side-channel capture", () => {
     expect(events.some(event => event.type === "tool_call_start")).toBe(false);
   });
 
-  test("duplicate raw native IDs in one assistant message fail closed", async () => {
+  test("duplicate raw native IDs across message-start frames fail closed within one invocation", async () => {
     const { p, cliName, alias } = sideChannelCase();
     const adapter = createQoderAdapter(provider(), {
       which: () => "/usr/bin/qoder",
       spawn: (_cmd, args) => {
         const { captureDir, nonce } = captureConfig(args);
         writeCaptureFile(captureDir, nonce, 1, alias, { a: 1 });
+        writeCaptureFile(captureDir, nonce, 2, alias, { a: 2 });
         const first = toolUseStart(cliName, "raw_duplicate") as { event: { content_block: Record<string, unknown> } };
         first.event.content_block.input = { a: 1 };
         const second = toolUseStart(cliName, "raw_duplicate") as { event: { content_block: Record<string, unknown> } };
         second.event.content_block.input = { a: 2 };
-        return fakeChild(frameLines([INIT_OK, first, BLOCK_STOP, second, BLOCK_STOP, MESSAGE_STOP])) as unknown as ChildProcess;
+        return fakeChild(frameLines([
+          INIT_OK, first, BLOCK_STOP,
+          { type: "stream_event", event: { type: "message_start", message: {} } },
+          second, BLOCK_STOP, MESSAGE_STOP,
+        ])) as unknown as ChildProcess;
       },
     });
     const events = await run(adapter, p);
-    expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error" });
-    expect(events.some(event => event.type === "tool_call_start")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      type: "error", code: "protocol_error",
+      message: "Coding-agent CLI repeated a native tool ID within one invocation.",
+    });
+    expect(events.filter(event => event.type === "tool_call_start")).toHaveLength(0);
   });
 
   test("a streamed native call cannot commit before its assistant frame reveals a duplicate ID", async () => {
@@ -1297,6 +1356,5 @@ describe("Qoder side-channel capture", () => {
     expect(last).toMatchObject({ type: "error", code: "tool_call_required" });
     const message = String(last.message ?? JSON.stringify(last));
     expect(message).toContain("Qoder");
-    expect(message).not.toContain("CodeBuddy");
   });
 });

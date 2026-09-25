@@ -107,20 +107,19 @@ async function consumeQoderFrames(
     }
   };
   // One mutable capture-lifecycle flag for the whole turn: set once the side-channel capture path
-  // emits its terminal (joined tool-call emission or a fail-closed capture error). Declared here so
+  // emits its terminal (joined batch emission or a fail-closed capture error). Declared here so
   // the post-reap tail observes the same state the stream loop wrote; the previous outer const /
   // inner let shadowing is gone.
   let captureCommitted = false;
-  // Side-channel join halves: the native streamed tool_use identity and the validated MCP capture
-  // record are collected independently; the client sees exactly one emission once both halves are
-  // present and agree on the wire tool identity.
-  let nativeToolCall: { id: string; wireName: string; json: string; input: NativeInput; rawPlaceholder: boolean; complete: boolean; malformed: boolean } | undefined;
-  const capturedToolCalls: Array<{ wireName: string; arguments: Record<string, unknown> }> = [];
+  // Collect the whole native invocation and its MCP captures before publishing any tool call.
+  const nativeToolCalls: Array<{ id: string; wireName: string; json: string; input: NativeInput; rawPlaceholder: boolean; complete: boolean; malformed: boolean }> = [];
+  const capturedToolCalls: Array<{ sequence: number; wireName: string; arguments: Record<string, unknown> }> = [];
   let toolCallStarts = 0;
   let initValidated = false;
   let captureMatchExpired = false;
   let streamEnded = false;
   let completeAssistantSeen = false;
+  let assistantToolIds: Set<string> | undefined;
   let sideChannelCheck: Promise<void> | undefined;
   const seenToolCallIds = new Set<string>();
   let assistantMessageEnded = false;
@@ -133,12 +132,11 @@ async function consumeQoderFrames(
   };
 
   const acceptedCaptureFiles = new Set<string>();
-  // Join by native name and arguments, never by independent stream/MCP arrival order.
-  // A missing or ambiguous input cannot borrow another call's capture record.
+  // Join by native name and arguments, consuming each capture once. Native order controls publish.
   const commitSideChannelCapture = (): void => {
     if (captureCommitted || isTerminal() || incoming.abortSignal?.aborted || !toolBridge) return;
-    const native = nativeToolCall;
-    if (!native || capturedToolCalls.length === 0 || (!native.complete && !streamEnded)) return;
+    if (nativeToolCalls.length === 0 || capturedToolCalls.length === 0 ||
+        (!streamEnded && nativeToolCalls.some(call => !call.complete))) return;
     // message_stop may precede the complete assistant frame, so it cannot settle
     // a raw identity or authorize fallback from absent native input by itself.
     if (!completeAssistantSeen && !state.sawTerminalResult && !streamEnded) return;
@@ -149,20 +147,42 @@ async function consumeQoderFrames(
       stopStream();
       return;
     }
-    const inputValue = native.input;
-    const captured = inputValue.kind === "valid"
-      ? capturedToolCalls.find(call => call.wireName === native.wireName && isDeepStrictEqual(call.arguments, inputValue.value))
-      : inputValue.kind === "absent" && native.json.length === 0 && toolCallStarts === 1 && capturedToolCalls.length === 1 &&
-          capturedToolCalls[0]?.wireName === native.wireName && (state.sawMessageStop || streamEnded)
-        ? capturedToolCalls[0]
-        : undefined;
-    if (!captured && !native.malformed && !streamEnded && !captureMatchExpired && !captureMatchTimer) {
+    const consumed = new Set<number>();
+    const matches = new Map<string, (typeof capturedToolCalls)[number]>();
+    let invalid = assistantToolIds !== undefined &&
+      (nativeToolCalls.length !== assistantToolIds.size || nativeToolCalls.some(call => !assistantToolIds!.has(call.id)));
+    let missing = false;
+    // Match known arguments first so a missing-input fallback cannot steal their capture.
+    for (const native of nativeToolCalls) {
+      if (native.malformed || native.input.kind === "invalid") { invalid = true; continue; }
+      if (native.input.kind !== "valid") continue;
+      const inputValue = native.input.value;
+      const captured = capturedToolCalls.find(call => !consumed.has(call.sequence) &&
+        call.wireName === native.wireName && isDeepStrictEqual(call.arguments, inputValue));
+      if (!captured) { missing = true; continue; }
+      consumed.add(captured.sequence);
+      matches.set(native.id, captured);
+    }
+    for (const native of nativeToolCalls) {
+      if (native.input.kind !== "absent") continue;
+      const candidates = capturedToolCalls.filter(call => !consumed.has(call.sequence) && call.wireName === native.wireName);
+      if (native.json.length !== 0 || candidates.length > 1) { invalid = true; continue; }
+      // Preserve the single-call fallback; in a batch, require one remaining capture per native.
+      if (!(state.sawMessageStop || streamEnded) || capturedToolCalls.length !== nativeToolCalls.length || candidates.length === 0) {
+        missing = true;
+        continue;
+      }
+      const captured = candidates[0]!;
+      consumed.add(captured.sequence);
+      matches.set(native.id, captured);
+    }
+    if (missing && !invalid && !streamEnded && !captureMatchExpired && !captureMatchTimer) {
       captureMatchTimer = setTimeout(() => {
         captureMatchExpired = true;
         commitSideChannelCapture();
       }, CAPTURE_MATCH_WAIT_MS);
     }
-    if (native.malformed || native.input.kind === "invalid" || (!captured && captureMatchExpired)) {
+    if (invalid || (missing && captureMatchExpired)) {
       captureCommitted = true;
       stopSideChannel();
       emitOnce({
@@ -177,12 +197,15 @@ async function consumeQoderFrames(
       stopStream();
       return;
     }
-    if (!captured) return;
+    if (missing) return;
     captureCommitted = true;
     stopSideChannel();
-    emitOnce({ type: "tool_call_start", id: native.id, name: native.wireName });
-    emitOnce({ type: "tool_call_delta", arguments: JSON.stringify(captured.arguments) });
-    emitOnce({ type: "tool_call_end" });
+    for (const native of nativeToolCalls) {
+      const captured = matches.get(native.id)!;
+      emitOnce({ type: "tool_call_start", id: native.id, name: native.wireName });
+      emitOnce({ type: "tool_call_delta", arguments: JSON.stringify(captured.arguments) });
+      emitOnce({ type: "tool_call_end" });
+    }
     emitOnce({
       type: "done",
       stopReason: "tool_use",
@@ -321,7 +344,7 @@ async function consumeQoderFrames(
           break;
         }
         acceptedCaptureFiles.add(file);
-        capturedToolCalls.push({ wireName, arguments: payload.arguments });
+        capturedToolCalls.push({ sequence: payload.sequence, wireName, arguments: payload.arguments });
       }
       commitSideChannelCapture();
     } catch (err) {
@@ -409,26 +432,30 @@ async function consumeQoderFrames(
             }
           }
         }
-        if (assistantToolUseCount > 1) {
-          throw new CodingAgentProtocolError("Coding-agent CLI returned multiple native tool calls in one assistant message.");
+        if (assistantToolUseCount !== assistantInputs.size) {
+          throw new CodingAgentProtocolError("Coding-agent CLI returned a native tool call without a valid ID.");
         }
-        if (nativeToolCall && assistantInputs.has(nativeToolCall.id)) {
-          const complete = assistantInputs.get(nativeToolCall.id)!;
+        for (const native of nativeToolCalls) {
+          const complete = assistantInputs.get(native.id);
+          if (!complete) continue;
           if (
-            toolBridge.emittedNameMap.get(complete.name) !== nativeToolCall.wireName ||
+            toolBridge.emittedNameMap.get(complete.name) !== native.wireName ||
             complete.input.kind === "invalid" ||
-            nativeToolCall.input.kind === "invalid" ||
-            (complete.input.kind === "valid" && nativeToolCall.input.kind === "valid" &&
-              !nativeToolCall.rawPlaceholder &&
-              !isDeepStrictEqual(nativeToolCall.input.value, complete.input.value))
+            native.input.kind === "invalid" ||
+            (complete.input.kind === "valid" && native.input.kind === "valid" &&
+              !native.rawPlaceholder &&
+              !isDeepStrictEqual(native.input.value, complete.input.value))
           ) {
-            nativeToolCall.malformed = true;
+            native.malformed = true;
           } else if (complete.input.kind === "valid") {
-            nativeToolCall.input = complete.input;
-            nativeToolCall.rawPlaceholder = false;
+            native.input = complete.input;
+            native.rawPlaceholder = false;
           }
         }
-        if (assistantInputs.size > 0) completeAssistantSeen = true;
+        if (assistantInputs.size > 0) {
+          completeAssistantSeen = true;
+          assistantToolIds = new Set(assistantInputs.keys());
+        }
       }
       const rawEvent = message.type === "stream_event" && message.event &&
         typeof message.event === "object" && !Array.isArray(message.event)
@@ -446,10 +473,8 @@ async function consumeQoderFrames(
       const mappedEvents = mapQoderStreamMessage(message, state, seenToolCallIds, Boolean(toolBridge));
       for (const event of mappedEvents) {
         if (captureCommitted) break;
-        // Side-channel v1: streamed tool_use frames never reach the client directly. They only
-        // supply the native tool identity half of the join; the capture record supplies the
-        // validated name+arguments half, and commitSideChannelCapture emits the single joined
-        // tool_call sequence once both halves agree.
+        // Streamed tool_use frames supply native identities; captures supply validated arguments.
+        // Neither half reaches the client until the complete batch has matched.
         if (toolBridge && event.type === "tool_call_start") {
           if (!initValidated) {
             emitOnce({ type: "error", message: "Coding-agent CLI called a tool before the tool bridge init handshake completed.", status: 502, errorType: "upstream_error", code: "tool_bridge_init_missing", retryable: false });
@@ -457,9 +482,12 @@ async function consumeQoderFrames(
             kill();
             break;
           }
+          if (nativeToolCalls.some(call => call.id === event.id)) {
+            throw new CodingAgentProtocolError("Coding-agent CLI repeated a native tool ID within one invocation.");
+          }
           toolCallStarts += 1;
-          if (toolCallStarts > 1) {
-            emitOnce({ type: "error", message: "Coding-agent CLI returned multiple native tool calls in one invocation.", status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false });
+          if (toolCallStarts > MAX_SIDE_CHANNEL_CALLS) {
+            emitOnce({ type: "error", message: "Too many native tool calls in one invocation.", status: 502, errorType: "upstream_error", code: "tool_call_limit", retryable: false });
             failClosed = true;
             kill();
             break;
@@ -473,44 +501,44 @@ async function consumeQoderFrames(
           }
           const inputState = assistantInputs.get(event.id)?.input ??
             (rawBlock?.type === "tool_use" ? nativeInput(rawBlock) : { kind: "absent" } as NativeInput);
-          nativeToolCall = {
+          nativeToolCalls.push({
             id: event.id, wireName, json: "", input: inputState,
             rawPlaceholder: Boolean(rawBlock && inputState.kind === "valid" && Object.keys(inputState.value).length === 0),
             complete: false, malformed: inputState.kind === "invalid",
-          };
-          commitSideChannelCapture();
+          });
           continue;
         }
         if (toolBridge && event.type === "tool_call_delta") {
-          if (toolCallStarts === 1 && nativeToolCall && !nativeToolCall.complete) {
-            nativeToolCall.json += event.arguments;
-            if (Buffer.byteLength(nativeToolCall.json, "utf8") > MAX_CAPTURE_BYTES) {
-              nativeToolCall.malformed = true;
-              nativeToolCall.json = "";
+          const native = nativeToolCalls.at(-1);
+          if (native && !native.complete) {
+            native.json += event.arguments;
+            if (Buffer.byteLength(native.json, "utf8") > MAX_CAPTURE_BYTES) {
+              native.malformed = true;
+              native.json = "";
             }
           }
           continue;
         }
         if (toolBridge && event.type === "tool_call_end") {
-          if (toolCallStarts === 1 && nativeToolCall) {
-            nativeToolCall.complete = true;
-            if (nativeToolCall.json && !nativeToolCall.malformed) {
+          const native = nativeToolCalls.at(-1);
+          if (native) {
+            native.complete = true;
+            if (native.json && !native.malformed) {
               try {
-                const input = JSON.parse(nativeToolCall.json);
+                const input = JSON.parse(native.json);
                 if (!input || typeof input !== "object" || Array.isArray(input) ||
-                  nativeToolCall.input.kind === "invalid" ||
-                  (nativeToolCall.input.kind === "valid" && !nativeToolCall.rawPlaceholder &&
-                    !isDeepStrictEqual(nativeToolCall.input.value, input))) {
-                  nativeToolCall.malformed = true;
+                  native.input.kind === "invalid" ||
+                  (native.input.kind === "valid" && !native.rawPlaceholder &&
+                    !isDeepStrictEqual(native.input.value, input))) {
+                  native.malformed = true;
                 } else {
-                  nativeToolCall.input = { kind: "valid", value: input };
-                  nativeToolCall.rawPlaceholder = false;
+                  native.input = { kind: "valid", value: input };
+                  native.rawPlaceholder = false;
                 }
               } catch {
-                nativeToolCall.malformed = true;
+                native.malformed = true;
               }
             }
-            commitSideChannelCapture();
           }
           continue;
         }
@@ -558,10 +586,10 @@ async function consumeQoderFrames(
     // runs. Read the capture directory once more while it still exists, then join or fail closed.
     streamEnded = true;
     if (!captureCommitted && toolBridge) {
-      if (nativeToolCall || capturedToolCalls.length > 0) await settleFinalCapture();
+      if (nativeToolCalls.length > 0 || capturedToolCalls.length > 0) await settleFinalCapture();
       else await checkSideChannel();
     }
-    if (!captureCommitted && !isTerminal() && pendingResultDone && !nativeToolCall && capturedToolCalls.length === 0) {
+    if (!captureCommitted && !isTerminal() && pendingResultDone && nativeToolCalls.length === 0 && capturedToolCalls.length === 0) {
       if (toolBridge?.requireToolCall && pendingResultDone.stopReason !== "tool_use" && (state.completedToolCalls ?? 0) === 0) {
         emitOnce({ type: "error", message: `${profile.label} finished without calling the required tool.`, status: 502, errorType: "upstream_error", code: "tool_call_required", retryable: false });
       } else {
@@ -575,11 +603,11 @@ async function consumeQoderFrames(
     stopSideChannel();
     if (sideChannelCheck) await sideChannelCheck;
   }
-  const missing = nativeToolCall === undefined
+  const missing = nativeToolCalls.length === 0
     ? "the native tool-use identity was never streamed"
     : "a matching MCP capture record never arrived";
   const endError: CodingAgentRawTurnResult["endError"] =
-    nativeToolCall !== undefined || capturedToolCalls.length > 0
+    nativeToolCalls.length > 0 || capturedToolCalls.length > 0
       ? { type: "error", message: `Coding-agent side-channel tool capture is incomplete: ${missing}.`, status: 502, errorType: "upstream_error", code: "protocol_error", retryable: false }
       : undefined;
   return { sawTerminalResult: state.sawTerminalResult, ...(endError ? { endError } : {}) };
