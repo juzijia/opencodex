@@ -543,7 +543,10 @@ export default function ProviderAuthPanel({
                       disabled={Boolean(showReauth || inCooldown || (switchingAccountId && !switching))}>
                       <span className={`pwi-auth-dot ${showReauth ? "pwi-auth-dot--warn" : account.active ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
                       <span className="pwi-auth-row-copy">
-                        <span className="pwi-auth-row-label">{label}</span>
+                        <span className="pwi-auth-row-heading">
+                          <span className="pwi-auth-row-label">{label}</span>
+                          {account.plan && <span className="badge badge-green">{account.plan}</span>}
+                        </span>
                         <span className="pwi-auth-row-secondary">{[account.email, `${t("prov.accountId")}: ${maskedId}`].filter(Boolean).join(" · ")}</span>
                         {healthSummary && (
                           <span className="pwi-auth-row-secondary faint">{healthSummary}</span>
