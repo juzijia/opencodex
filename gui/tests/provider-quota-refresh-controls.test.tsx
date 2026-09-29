@@ -252,28 +252,38 @@ test("Antigravity plan badge localizes Free, preserves provider names, and leave
   win.localStorage.setItem("ocx-lang", "zh");
   const item = { ...oauthItem, name: "google-antigravity" };
   const handlers = authHandlers({ onPauseAccount: () => {} });
-  const row = { id: "ag-1", active: true, paused: false, plan: "Free" as string | null };
-  const view = (plan: string | null, paused = false) =>
-    <ProviderAuthPanel item={item} apiBase="" accounts={[{ ...row, plan, paused }]} authHandlers={handlers} />;
-  await render(view("Free"));
+  const row = { id: "ag-1", active: true, paused: false };
+  const view = (plan: string | null, paused = false, pausingAccountId: string | null = null) =>
+    <ProviderAuthPanel item={item} apiBase="" accounts={[{ ...row, plan, paused }]}
+      pausingAccountId={pausingAccountId} authHandlers={handlers} />;
   const main = () => host.querySelector(".pwi-auth-row-main") as HTMLButtonElement;
-  const heading = () => host.querySelector(".pwi-auth-row-heading")!;
-  expect(heading().textContent).toContain("免费");
+  const badge = () => main().querySelector(".pwi-auth-row-copy .badge");
+
+  await render(view("Free"));
+  expect(badge()?.textContent).toBe("免费");
   expect(main().getAttribute("aria-label")).toContain("免费");
-  expect(findButton("暂停")).not.toBeNull();
+  expect(main().getAttribute("aria-label")).toContain("当前");
 
   await render(view("Google AI Pro"));
-  expect(heading().textContent).toContain("Google AI Pro");
+  expect(badge()?.textContent).toBe("Google AI Pro");
   expect(main().getAttribute("aria-label")).toContain("Google AI Pro");
-  expect(heading().textContent).not.toContain("免费");
 
   await render(view("Google AI Ultra", true));
-  expect(heading().textContent).toContain("Google AI Ultra");
+  expect(badge()?.textContent).toBe("Google AI Ultra");
   expect(main().disabled).toBe(true);
   expect(findButton("恢复")).not.toBeNull();
 
+  await render(view("Google AI Pro", false, row.id));
+  expect(badge()?.textContent).toBe("Google AI Pro");
+  expect(main().disabled).toBe(true);
+  const pause = findButton("暂停");
+  expect(pause?.disabled).toBe(true);
+  expect(pause?.getAttribute("aria-busy")).toBe("true");
+
   await render(view(null));
-  expect(heading().querySelector(".badge")).toBeNull();
+  expect(badge()).toBeNull();
+  expect(main().closest(".pwi-auth-acct")?.textContent).not.toMatch(/null/i);
+  expect(main().getAttribute("aria-label")).not.toMatch(/null/i);
   expect(main().getAttribute("aria-label")).not.toContain("Google AI");
   expect(main().getAttribute("aria-label")).not.toContain("免费");
 });

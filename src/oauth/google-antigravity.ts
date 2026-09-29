@@ -104,32 +104,33 @@ function extractPaidTierPlan(data: Record<string, unknown>): string | null {
   if (!paidTier || typeof paidTier !== "object") return null;
   const tier = paidTier as { id?: unknown; name?: unknown };
   if (tier.id === "free-tier") return "Free";
-  if (typeof tier.name === "string" && /^Google AI [^\s\x00-\x1f\x7f][^\x00-\x1f\x7f]*$/.test(tier.name) && tier.name === tier.name.trim()) return tier.name;
-  return null;
+  if (typeof tier.name !== "string" || /[\x00-\x1f\x7f-\x9f]/.test(tier.name)) return null;
+  const name = tier.name.trim();
+  return name.length <= 128 && /^Google AI [^\s\x00-\x1f\x7f-\x9f][^\x00-\x1f\x7f-\x9f]*$/.test(name) ? name : null;
 }
 
 /**
  * loadCodeAssist discovery for an access token. A plan/project observation is returned only when
- * the call succeeded and produced a parseable body; a network error, non-2xx or unparseable
- * response yields `{}` so the caller keeps the last known value instead of inventing one.
+ * the call succeeded and produced a parseable body. A fetch rejection propagates (so project
+ * discovery does not onboard); non-2xx and JSON parse failure yield no observation.
  */
 async function loadCodeAssistDiscovery(accessToken: string, signal?: AbortSignal): Promise<{ projectId?: string; plan?: string | null }> {
-  let data: Record<string, unknown> | undefined;
+  const response = await fetch(`${PROD_API}/${API_VERSION}:loadCodeAssist`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, Accept: "*/*", "Content-Type": "application/json", "User-Agent": antigravityUserAgent() },
+    body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
+    signal: requestSignal(signal),
+  });
+  if (!response.ok) return {};
+  let data: unknown;
   try {
-    const response = await fetch(`${PROD_API}/${API_VERSION}:loadCodeAssist`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${accessToken}`, Accept: "*/*", "Content-Type": "application/json", "User-Agent": antigravityUserAgent() },
-      body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
-      signal: requestSignal(signal),
-    });
-    if (!response.ok) return {};
-    data = (await response.json().catch(() => undefined)) as Record<string, unknown> | undefined;
+    data = await response.json();
   } catch {
     return {};
   }
-  if (data === undefined) return {};
   if (!data || typeof data !== "object" || Array.isArray(data)) return { plan: null };
-  return { projectId: extractProjectId(data), plan: extractPaidTierPlan(data) };
+  const projectId = extractProjectId(data as Record<string, unknown>);
+  return { ...(projectId ? { projectId } : {}), plan: extractPaidTierPlan(data as Record<string, unknown>) };
 }
 
 async function onboardProject(accessToken: string, signal?: AbortSignal): Promise<string | undefined> {
@@ -174,7 +175,7 @@ export async function discoverAntigravityAccount(accessToken: string, signal?: A
   const discovery = await loadCodeAssistDiscovery(accessToken, signal);
   if (discovery.projectId) return discovery;
   const onboarded = await onboardProject(accessToken, signal).catch(() => undefined);
-  return { ...(onboarded ? { projectId: onboarded } : {}), ...(discovery.plan !== undefined ? { plan: discovery.plan } : {}) };
+  return { ...discovery, ...(onboarded ? { projectId: onboarded } : {}) };
 }
 
 /** Discover the CCA project for an access token (loadCodeAssist → onboardUser fallback). */
@@ -254,7 +255,7 @@ class AntigravityOAuthFlow extends OAuthCallbackFlow {
       // missing CCA project — otherwise status shows "logged in" while all calls fail closed.
       throw new Error("Antigravity login could not discover a Cloud Code Assist project for this account. Ensure the account has Antigravity/Cloud Code Assist access and try again.");
     }
-    return { ...creds, projectId: discovery.projectId, ...(discovery.plan !== undefined ? { plan: discovery.plan } : {}) };
+    return { ...creds, ...discovery };
   }
 }
 
@@ -272,14 +273,9 @@ export async function refreshAntigravityToken(refreshToken: string, signal?: Abo
   }, signal);
   const creds = credentialsFromPayload(payload, refreshToken);
   // Re-discover on refresh so a newly-onboarded account fills in projectId and a reported tier is
-  // refreshed. A discovery hiccup must never fail the refresh: loadCodeAssist folds network and
-  // onboarding errors into "no observation", which merged() then retains.
-  const discovery = await discoverAntigravityAccount(creds.access, signal);
-  return {
-    ...creds,
-    ...(discovery.projectId ? { projectId: discovery.projectId } : {}),
-    ...(discovery.plan !== undefined ? { plan: discovery.plan } : {}),
-  };
+  // refreshed. A fetch rejection must not fail token refresh or clear a previous plan.
+  const discovery = await discoverAntigravityAccount(creds.access, signal).catch(() => ({}));
+  return { ...creds, ...discovery };
 }
 
 /**

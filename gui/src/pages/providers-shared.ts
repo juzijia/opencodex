@@ -45,7 +45,6 @@ export interface OAuthAccount {
   active: boolean;
   needsReauth?: boolean;
   expiresAt?: number;
-  plan?: string | null;
 }
 
 const OAUTH_LABELS: Record<string, string> = {
