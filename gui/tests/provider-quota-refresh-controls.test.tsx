@@ -247,3 +247,33 @@ test("changing active account discards the previous refresh feedback", async () 
   expect(host.textContent).not.toContain("Quota check completed");
   expect(findButton("Refresh quotas")?.disabled).toBe(false);
 });
+
+test("Antigravity plan badge localizes Free, preserves provider names, and leaves pause controls intact", async () => {
+  win.localStorage.setItem("ocx-lang", "zh");
+  const item = { ...oauthItem, name: "google-antigravity" };
+  const handlers = authHandlers({ onPauseAccount: () => {} });
+  const row = { id: "ag-1", active: true, paused: false, plan: "Free" as string | null };
+  const view = (plan: string | null, paused = false) =>
+    <ProviderAuthPanel item={item} apiBase="" accounts={[{ ...row, plan, paused }]} authHandlers={handlers} />;
+  await render(view("Free"));
+  const main = () => host.querySelector(".pwi-auth-row-main") as HTMLButtonElement;
+  const heading = () => host.querySelector(".pwi-auth-row-heading")!;
+  expect(heading().textContent).toContain("免费");
+  expect(main().getAttribute("aria-label")).toContain("免费");
+  expect(findButton("暂停")).not.toBeNull();
+
+  await render(view("Google AI Pro"));
+  expect(heading().textContent).toContain("Google AI Pro");
+  expect(main().getAttribute("aria-label")).toContain("Google AI Pro");
+  expect(heading().textContent).not.toContain("免费");
+
+  await render(view("Google AI Ultra", true));
+  expect(heading().textContent).toContain("Google AI Ultra");
+  expect(main().disabled).toBe(true);
+  expect(findButton("恢复")).not.toBeNull();
+
+  await render(view(null));
+  expect(heading().querySelector(".badge")).toBeNull();
+  expect(main().getAttribute("aria-label")).not.toContain("Google AI");
+  expect(main().getAttribute("aria-label")).not.toContain("免费");
+});

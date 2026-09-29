@@ -3,7 +3,8 @@ import { discoverAntigravityProject, refreshAntigravityToken } from "../../../sr
 import { mkdirSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getCredential, saveCredential } from "../../../src/oauth/store";
+import { getAccountCredential, getAccountSet, getCredential, saveCredential } from "../../../src/oauth/store";
+import { getValidAccessTokenForAccount, getLoginStatus } from "../../../src/oauth";
 import { ANTIGRAVITY_IDE_VERSION } from "../../../src/adapters/client-fingerprint";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
 
@@ -133,6 +134,21 @@ describe("antigravity refresh", () => {
     expect(cred.expires - issuedAt).toBe(55 * 60 * 1000);
   });
 
+  test.each([
+    [{ id: "free-tier", name: "Free" }, "Free"],
+    [{ id: "paid-pro", name: "Google AI Pro" }, "Google AI Pro"],
+    [{ id: "fixture-ultra", name: "Google AI Ultra" }, "Google AI Ultra"],
+    [{ id: "unknown-product", name: "Other Product" }, null],
+    [undefined, null],
+  ] as const)("observes loadCodeAssist paidTier %p as %p", async (paidTier, expected) => {
+    routeFetch(url => {
+      if (url.includes("oauth2.googleapis.com/token")) return Response.json({ access_token: "fresh", expires_in: 3600 });
+      if (url.includes(":loadCodeAssist")) return Response.json({ cloudaicompanionProject: "proj", paidTier });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    expect((await refreshAntigravityToken("rt")).plan).toBe(expected);
+  });
+
   test("refresh failure carries status only, not the response body", async () => {
     routeFetch((url) => {
       if (url.includes("oauth2.googleapis.com/token")) return new Response("invalid_grant secret-detail", { status: 400 });
@@ -155,6 +171,64 @@ describe("antigravity credential persistence (projectId survives the store)", ()
     if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
     if (origOcxHome === undefined) delete process.env.OPENCODEX_HOME; else process.env.OPENCODEX_HOME = origOcxHome;
     if (tmp) removeTreeWithRetry(tmp);
+  });
+
+  test.each([
+    ["request failure", "throw", "Google AI Pro"],
+    ["non-2xx", "status", "Google AI Pro"],
+    ["unparseable body", "invalid", "Google AI Pro"],
+    ["unknown product", "unknown", null],
+    ["missing tier", "missing", null],
+    ["observed null then onboarding throws", "null-onboard", null],
+    ["observed Pro then onboarding throws", "pro-onboard", "Google AI Pro"],
+  ] as const)("refresh keeps or replaces previous Pro: %s", async (_label, mode, expected) => {
+    tmp = join(tmpdir(), `ag-plan-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    mkdirSync(tmp, { recursive: true });
+    process.env.HOME = tmp;
+    process.env.OPENCODEX_HOME = join(tmp, "ocx");
+    await saveCredential("google-antigravity", {
+      access: "old", refresh: "rt", expires: Date.now() - 1000,
+      projectId: "proj-old", plan: "Google AI Pro",
+    });
+    const id = getAccountSet("google-antigravity")!.activeAccountId;
+    routeFetch(url => {
+      if (url.includes("oauth2.googleapis.com/token")) return Response.json({ access_token: "fresh", expires_in: 3600 });
+      if (url.includes(":loadCodeAssist")) {
+        if (mode === "throw") throw new Error("offline");
+        if (mode === "status") return new Response("failure", { status: 503 });
+        if (mode === "invalid") return new Response("not json");
+        const paidTier = mode === "unknown" || mode === "null-onboard"
+          ? { id: "other", name: "Other Product" }
+          : mode === "pro-onboard" ? { id: "pro", name: "Google AI Pro" } : undefined;
+        return Response.json({ ...(mode === "unknown" || mode === "missing" ? { cloudaicompanionProject: "proj-new" } : {}), paidTier });
+      }
+      if (url.includes(":onboardUser")) {
+        if (mode.endsWith("-onboard")) throw new Error("onboarding unavailable");
+        return new Response("forbidden", { status: 403 });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    expect(await getValidAccessTokenForAccount("google-antigravity", id)).toBe("fresh");
+    expect(getAccountCredential("google-antigravity", id)?.plan).toBe(expected);
+    expect(getLoginStatus("google-antigravity").accounts?.[0]?.plan).toBe(expected);
+  });
+
+  test("plan normalization persists null, trims bounded names, rejects controls and accepts legacy records", async () => {
+    tmp = join(tmpdir(), `ag-store-plan-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    mkdirSync(tmp, { recursive: true });
+    process.env.HOME = tmp;
+    process.env.OPENCODEX_HOME = join(tmp, "ocx");
+    const base = { access: "a", refresh: "r", expires: Date.now() + 3_600_000 };
+    await saveCredential("google-antigravity", { ...base, plan: null });
+    expect(getCredential("google-antigravity")?.plan).toBeNull();
+    await saveCredential("google-antigravity", { ...base, plan: "  Google AI Pro  " });
+    expect(getCredential("google-antigravity")?.plan).toBe("Google AI Pro");
+    for (const bad of ["bad\nplan", "x".repeat(129)]) {
+      await saveCredential("google-antigravity", { ...base, plan: bad });
+      expect(getCredential("google-antigravity")?.plan).toBeUndefined();
+    }
+    await saveCredential("google-antigravity", base);
+    expect(getCredential("google-antigravity")?.plan).toBeUndefined();
   });
 
   test("saveCredential + getCredential round-trips projectId (regression: was stripped by normalizeCredential)", async () => {

@@ -532,6 +532,11 @@ function normalizeCredential(cred: unknown): OAuthCredentials | null {
   if (typeof candidate.accountId === "string" && candidate.accountId.length > 0) normalized.accountId = candidate.accountId;
   if (isCredentialSource(candidate.source)) normalized.source = candidate.source;
   if (typeof candidate.projectId === "string" && candidate.projectId.length > 0) normalized.projectId = candidate.projectId;
+  if (candidate.plan === null) normalized.plan = null;
+  else if (typeof candidate.plan === "string") {
+    const plan = candidate.plan.trim();
+    if (plan.length > 0 && plan.length <= 128 && !/[\x00-\x1f\x7f]/.test(plan)) normalized.plan = plan;
+  }
   if (typeof candidate.apiBaseUrl === "string" && candidate.apiBaseUrl.length > 0) {
     // Persist only allowlisted origins; drop anything else so auth.json cannot
     // become an SSRF springboard across reloads. Copilot and Devin are the two
