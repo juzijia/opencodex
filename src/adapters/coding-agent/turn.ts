@@ -43,6 +43,9 @@ export interface CodingAgentDeps {
   killWindowsProcessTree?: KillWindowsProcessTreeFn;
   /** Test seam for a catalog/config write failure after private bridge-directory creation. */
   writeToolBridgeFile?: typeof writeFile;
+  /** Injectable timer primitives for deterministic tests without sleeping. */
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
 }
 
 const DEFAULT_TIMEOUT_MS = 300_000;
@@ -113,28 +116,33 @@ export interface CodingAgentTurnInput {
   /** Family-specific scoped env builder (credential + region switch on top of baseScopedEnv). */
   buildEnv: (profile: CodingAgentProviderProfile, apiKey: string) => Record<string, string>;
   /**
-   * Opt-in capture-only tool bridge. When present with a non-empty catalog, the turn writes a
-   * validated catalog plus an MCP config to a private temp dir, passes `--mcp-config` (with exact
-   * `--allowedTools`) alongside the family's tools-disabled args, translates captured tool_use
-   * names back to request wire names, and terminates the process tree at `message_stop` because
-   * the capture-only MCP handler intentionally never answers. Execution stays with the client.
+   * Opt-in isolated MCP catalog. The turn writes a catalog and MCP config to a private temp dir,
+   * advertises only the selected names, and returns structured CLI tool intent to the client.
+   * The MCP handler never executes the client tool.
    */
   toolBridge?: CodingAgentToolBridgeInput;
   deps: CodingAgentDeps;
 }
 
-/** Opt-in capture-only tool bridge for one coding-agent CLI turn. */
+/** Opt-in isolated tool catalog for one coding-agent CLI turn. */
 export interface CodingAgentToolBridgeInput {
   /** MCP server name advertised to the CLI; tool_use blocks render it as `mcp__<name>__<tool>`. */
   serverName: string;
-  /** Absolute path of the capture-only MCP server module, run with the serving runtime. */
+  /** Absolute path of the MCP server module, run with the serving runtime. */
   serverModulePath: string;
   /** Validated tool catalog advertised over ListTools; the server never executes a call. */
   tools: ReadonlyArray<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
   /** CLI-emitted tool name (`mcp__<server>__<tool>`) to the request's wire tool name. */
   emittedNameMap: Map<string, string>;
-  /** Captured tool_use blocks accepted in one assistant message. */
+  /** Tool_use blocks accepted in one assistant message. */
   maxTurnToolCalls: number;
+  /** Finish the turn when a complete assistant frame supplies structured tool_use blocks. */
+  completeAssistantToolUse?: boolean;
+  /** Optional quiet fallback window (ms) for completing tool legs without message_stop. */
+  assistantToolQuietFallbackMs?: number;
+  /** Family-specific CLI flag spelling and compiled MCP helper entrypoint. */
+  allowedToolsFlag?: string;
+  standaloneEntrypoint?: string;
   /**
    * The request's `tool_choice` requires a tool call (`required`, or a named selection).
    * The nested CLI has no documented force-tool flag, so this is enforced locally: a
@@ -164,6 +172,8 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   const killGraceMs = deps.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   const reapTimeoutMs = deps.reapTimeoutMs ?? (killGraceMs * 2 + 250);
   const platform = deps.platform ?? process.platform;
+  const setTimeoutFn = deps.setTimeout ?? setTimeout;
+  const clearTimeoutFn = deps.clearTimeout ?? clearTimeout;
 
   if (incoming.abortSignal?.aborted) {
     emit({ type: "error", message: "Coding-agent turn was aborted before start." });
@@ -240,7 +250,11 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             [toolBridge.serverName]: {
               type: "stdio",
               command: process.execPath,
-              args: codeBuddyMcpInvocation(toolBridge.serverModulePath, catalogPath),
+              args: toolBridge.standaloneEntrypoint
+                ? (isStandaloneBinary()
+                  ? [toolBridge.standaloneEntrypoint, catalogPath]
+                  : [toolBridge.serverModulePath, catalogPath])
+                : codeBuddyMcpInvocation(toolBridge.serverModulePath, catalogPath),
               defer_loading: false,
               alwaysLoad: true,
             },
@@ -265,8 +279,8 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   const args = buildArgs(profile, parsed, provider);
   if (toolBridge && toolBridgeMcpConfigPath) {
     // Exact names close the wildcard domain; --strict-mcp-config (family args) keeps user
-    // servers out, so the capture server is the only capability this turn can reach.
-    args.push("--allowedTools", [...toolBridge.emittedNameMap.keys()].join(","), "--mcp-config", toolBridgeMcpConfigPath);
+    // servers out, so this isolated server is the only capability this turn can reach.
+    args.push(toolBridge.allowedToolsFlag ?? "--allowedTools", [...toolBridge.emittedNameMap.keys()].join(","), "--mcp-config", toolBridgeMcpConfigPath);
   }
   const env = buildEnv(profile, apiKey);
   const invocation = commandInvocation(binary, args, platform, { env });
@@ -315,10 +329,18 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   });
 
   let terminalEmitted = false;
+  let quietFallbackTimer: ReturnType<typeof setTimeout> | undefined;
+  const cancelQuietFallback = (): void => {
+    if (quietFallbackTimer !== undefined) {
+      clearTimeoutFn(quietFallbackTimer);
+      quietFallbackTimer = undefined;
+    }
+  };
   const emitOnce = (event: AdapterEvent): void => {
     if (event.type === "done" || event.type === "error" || event.type === "incomplete") {
       if (terminalEmitted) return;
       terminalEmitted = true;
+      cancelQuietFallback();
     }
     emit(event);
   };
@@ -327,6 +349,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   let killed = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   const kill = (): void => {
+    cancelQuietFallback();
     if (killed || child.killed) return;
     killed = true;
     if (platform === "win32" && child.pid !== undefined) {
@@ -339,7 +362,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     // mcp-server.ts exits on stdin EOF, so this ladder reaps the whole tree without knowing
     // the grandchild pid.
     try { child.kill("SIGTERM"); } catch { /* already gone */ }
-    killTimer = setTimeout(() => {
+    killTimer = setTimeoutFn(() => {
       try { child.kill("SIGKILL"); } catch { /* already gone */ }
     }, killGraceMs);
   };
@@ -348,11 +371,12 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     try { child.stdout?.destroy(); } catch { /* already closed */ }
   };
   const onAbort = (): void => {
+    cancelQuietFallback();
     kill();
     stopStream();
   };
   incoming.abortSignal?.addEventListener("abort", onAbort, { once: true });
-  const timeoutTimer = setTimeout(() => {
+  const timeoutTimer = setTimeoutFn(() => {
     kill();
     stopStream();
     emitOnce({ type: "error", message: `${profile.label} turn timed out.`, status: 504, errorType: "upstream_error", code: "timeout", retryable: true });
@@ -364,7 +388,8 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   });
 
   const cleanup = (): void => {
-    clearTimeout(timeoutTimer);
+    clearTimeoutFn(timeoutTimer);
+    cancelQuietFallback();
     incoming.abortSignal?.removeEventListener("abort", onAbort);
     try { child.stdin?.destroy(); } catch { /* ignore */ }
     // Termination is owned by the reap step below, not here: killing in cleanup would set
@@ -374,6 +399,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   let streamProtocolError: string | undefined;
   let streamProtocolCode: string | undefined;
   let turnError: string | undefined;
+  let failClosed = false;
   // A successful result frame that arrived after every captured tool call completed but
   // before message_stop. The bridge contract still ends the leg with the synthesized
   // done(tool_use) at message_stop, so the result-derived done(stop) is deferred and its
@@ -389,6 +415,45 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     maxToolBlockStarts: toolBridge?.maxTurnToolCalls,
     strictToolBlockCapture: Boolean(toolBridge),
     partialToolCallIds: toolBridge ? new Set<string>() : undefined,
+    completeAssistantToolUse: toolBridge?.completeAssistantToolUse,
+  };
+
+  const fallbackMs = toolBridge?.assistantToolQuietFallbackMs;
+
+  const onQuietFallbackExpiry = (timer: ReturnType<typeof setTimeout>): void => {
+    if (quietFallbackTimer !== timer) return;
+    quietFallbackTimer = undefined;
+
+    if (terminalEmitted) return;
+    if (incoming.abortSignal?.aborted) return;
+    if (state.sawMessageStop) return;
+    if ((state.completedToolCalls ?? 0) <= 0) return;
+    if (
+      (state.openToolBlocks?.size ?? 0) > 0
+      || ((state.toolBlockStarts ?? 0) > 0 && (state.completedToolCalls ?? 0) !== (state.toolBlockStarts ?? 0))
+    ) {
+      return;
+    }
+    if (failClosed || streamProtocolError !== undefined || turnError !== undefined) return;
+
+    const terminalUsage = deferredResultDone?.usage ?? state.partialUsage;
+    emitOnce({
+      type: "done",
+      stopReason: "tool_use",
+      endTurn: false,
+      ...(terminalUsage ? { usage: terminalUsage } : {}),
+    });
+    kill();
+    stopStream();
+  };
+
+  const scheduleQuietFallback = (): void => {
+    if (fallbackMs === undefined || fallbackMs <= 0) return;
+    cancelQuietFallback();
+    const timer = setTimeoutFn(() => {
+      onQuietFallbackExpiry(timer);
+    }, fallbackMs);
+    quietFallbackTimer = timer;
   };
 
   try {
@@ -403,14 +468,16 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
       const historyCharLimit = projectedHistoryCharLimit(
         modelRecordValue(provider.modelContextWindows, parsed.modelId) ?? provider.contextWindow,
       );
-      for (const line of buildConversationInput(parsed, { maxHistoryChars: historyCharLimit })) stdin.write(`${line}\n`);
+      const vendorNameByWire = toolBridge?.emittedNameMap
+        ? new Map([...toolBridge.emittedNameMap].map(([emitted, wire]) => [wire, emitted]))
+        : undefined;
+      for (const line of buildConversationInput(parsed, { maxHistoryChars: historyCharLimit, vendorNameByWire })) stdin.write(`${line}\n`);
       stdin.end();
     }
     const stdout = child.stdout;
     if (!stdout) throw new CodingAgentProtocolError(`${profile.label} CLI produced no stdout stream`);
     try {
       let initValidated = false;
-      let failClosed = false;
       for await (const message of readJsonLines(stdout)) {
         if (incoming.abortSignal?.aborted) break;
         if (toolBridge) {
@@ -452,6 +519,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             break;
           }
         }
+        const completedCallsBefore = state.completedToolCalls ?? 0;
         const mappedEvents = mapStreamMessageToEvents(message, state);
         if (state.toolCallLimitExceeded) {
           emitOnce({
@@ -522,7 +590,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             // other bridge contract violations use.
             emitOnce({
               type: "error",
-              message: "CodeBuddy finished without calling the required tool.",
+              message: "Coding-agent CLI finished without calling the required tool.",
               status: 502,
               errorType: "upstream_error",
               code: "tool_call_required",
@@ -578,6 +646,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             : event);
         }
         if (failClosed) break;
+        const newlyCompletedCalls = (state.completedToolCalls ?? 0) - completedCallsBefore;
         if (
           toolBridge
           && !terminalEmitted
@@ -585,6 +654,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           && (state.toolBlockStarts ?? 0) > 0
           && (state.completedToolCalls ?? 0) !== (state.toolBlockStarts ?? 0)
         ) {
+          cancelQuietFallback();
           emitOnce({
             type: "error",
             message: "Coding-agent CLI ended with an incomplete tool call.",
@@ -597,6 +667,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           break;
         }
         if (toolBridge && !terminalEmitted && state.sawMessageStop && (state.completedToolCalls ?? 0) > 0) {
+          cancelQuietFallback();
           // The raw-start gate above already refused any call opened before the handshake.
           // The capture-only MCP handler never answers, so the CLI parks after message_stop.
           // The completed tool_use blocks are this turn's structured output: end the leg here
@@ -612,6 +683,19 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           });
           kill();
           break;
+        }
+        if (
+          fallbackMs !== undefined
+          && fallbackMs > 0
+          && !terminalEmitted
+          && !state.sawMessageStop
+          && message.type === "assistant"
+        ) {
+          if (quietFallbackTimer !== undefined) {
+            scheduleQuietFallback();
+          } else if (newlyCompletedCalls > 0) {
+            scheduleQuietFallback();
+          }
         }
         if (terminalEmitted) break;
       }
@@ -633,17 +717,17 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
 
   // Reap the process so no zombie is left behind (§三十): wait for the real `close`, and
   // force-terminate only if it lingers past the grace window after the stream ended.
-  const graceTimer = setTimeout(() => { kill(); }, killGraceMs);
+  const graceTimer = setTimeoutFn(() => { kill(); }, killGraceMs);
   let reapTimer: ReturnType<typeof setTimeout> | undefined;
   await Promise.race([
     processLifecycle,
     new Promise<void>(resolve => {
-      reapTimer = setTimeout(resolve, reapTimeoutMs);
+      reapTimer = setTimeoutFn(resolve, reapTimeoutMs);
     }),
   ]);
-  clearTimeout(graceTimer);
-  if (reapTimer) clearTimeout(reapTimer);
-  if (killTimer) clearTimeout(killTimer);
+  clearTimeoutFn(graceTimer);
+  if (reapTimer) clearTimeoutFn(reapTimer);
+  if (killTimer) clearTimeoutFn(killTimer);
 
   if (!terminalEmitted) {
     const stderr = redactSecrets(boundedStderr(stderrChunks), profile.tokenEnv, apiKey);

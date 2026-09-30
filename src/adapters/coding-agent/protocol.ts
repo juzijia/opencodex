@@ -1,4 +1,4 @@
-import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxUsage } from "../../types";
+import { namespacedToolName, type AdapterEvent, type OcxMessage, type OcxParsedRequest, type OcxUsage } from "../../types";
 import type { TranslatorBudget } from "../../lib/translator-budget";
 
 /**
@@ -258,6 +258,8 @@ export interface StreamParseState {
   partialToolCallBudgetIds?: string[];
   /** A complete assistant tool block had no matching partial capture. */
   uncapturedToolUse?: boolean;
+  /** Consume complete assistant tool_use blocks when the CLI does not stream partial tool events. */
+  completeAssistantToolUse?: boolean;
   /** Highest-seen usage snapshot from `message_delta`/assistant frames before a terminal result. */
   partialUsage?: OcxUsage;
 }
@@ -297,7 +299,17 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
           if (thinking) events.push({ type: "thinking_delta", thinking });
         } else if (blockType === "tool_use") {
           const id = asString(part.id);
-          if (!id || !state.partialToolCallIds?.has(id)) state.uncapturedToolUse = true;
+          if (state.completeAssistantToolUse && !state.partialToolCallIds?.has(id ?? "")) {
+            const name = asString(part.name);
+            const input = asRecord(part.input);
+            if (!id || !name || !input) throw new CodingAgentProtocolError("Coding-agent CLI returned a tool call without structured identity and input.");
+            events.push(
+              { type: "tool_call_start", id, name },
+              { type: "tool_call_delta", arguments: JSON.stringify(input) },
+              { type: "tool_call_end" },
+            );
+            state.completedToolCalls = (state.completedToolCalls ?? 0) + 1;
+          } else if (!id || !state.partialToolCallIds?.has(id)) state.uncapturedToolUse = true;
         }
       }
     }
@@ -625,7 +637,7 @@ function imagePart(imageUrl: string): WireContentPart | undefined {
   return undefined;
 }
 
-function formatMessageForHistory(message: OcxMessage): string {
+function formatMessageForHistory(message: OcxMessage, vendorNameByWire?: ReadonlyMap<string, string>): string {
   if (message.role === "user") {
     const text = typeof message.content === "string"
       ? message.content
@@ -640,8 +652,10 @@ function formatMessageForHistory(message: OcxMessage): string {
       } else if (part.type === "thinking" && part.thinking.trim()) {
         parts.push(`[Thinking: ${part.thinking.trim()}]`);
       } else if (part.type === "toolCall") {
+        const wireName = namespacedToolName(part.namespace, part.name);
+        const name = vendorNameByWire?.get(wireName) ?? wireName;
         const args = JSON.stringify(part.arguments ?? {});
-        parts.push(`[Tool call: ${part.name} (call_id: ${part.id}) with args: ${args}]`);
+        parts.push(`[Tool call: ${name} (call_id: ${part.id}) with args: ${args}]`);
       }
     }
     return `ASSISTANT:\n${parts.join("\n") || "(empty response)"}`;
@@ -663,7 +677,10 @@ function formatMessageForHistory(message: OcxMessage): string {
  * accepts `type: "user"` frames. Writing undocumented `type: "assistant"` frames is rejected.
  * Non-user messages are therefore projected into valid user frames.
  */
-export function buildInputLines(message: OcxMessage): string[] {
+export function buildInputLines(
+  message: OcxMessage,
+  options: { vendorNameByWire?: ReadonlyMap<string, string> } = {},
+): string[] {
   if (message.role === "developer") return [];
 
   const content: WireContentPart[] = [];
@@ -684,7 +701,7 @@ export function buildInputLines(message: OcxMessage): string[] {
       }
     }
   } else {
-    const formatted = formatMessageForHistory(message);
+    const formatted = formatMessageForHistory(message, options.vendorNameByWire);
     if (formatted) content.push(textPart(formatted));
   }
 
@@ -718,14 +735,17 @@ export function buildSystemPrompt(parsed: OcxParsedRequest): string | undefined 
  * prior conversation turns are structured as bounded context text with tool results as text,
  * clearly demarcated from the current user request. Codex retains tool control; vendor tools are never invoked.
  */
-export function buildConversationInput(parsed: OcxParsedRequest, options: { maxHistoryChars?: number } = {}): string[] {
+export function buildConversationInput(
+  parsed: OcxParsedRequest,
+  options: { maxHistoryChars?: number; vendorNameByWire?: ReadonlyMap<string, string> } = {},
+): string[] {
   const nonDev = parsed.context.messages.filter(m => m.role !== "developer");
   if (nonDev.length === 0) {
     return [JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: "" }] } })];
   }
 
   if (nonDev.length === 1 && nonDev[0]!.role === "user") {
-    return buildInputLines(nonDev[0]!);
+    return buildInputLines(nonDev[0]!, { vendorNameByWire: options.vendorNameByWire });
   }
 
   // Multi-turn conversation or history with tool results:
@@ -796,13 +816,16 @@ export function buildConversationInput(parsed: OcxParsedRequest, options: { maxH
     const status = currentMessage.isError ? " (error)" : "";
     currentRequestText = `TOOL RESULT (call_id: ${currentMessage.toolCallId})${status}:\n${text}\n\nPlease proceed based on the above tool result.`;
   } else {
-    currentRequestText = formatMessageForHistory(currentMessage);
+    currentRequestText = formatMessageForHistory(currentMessage, options.vendorNameByWire);
   }
 
   const imageBlocks: WireContentPart[] = [...historyImageBlocks, ...currentImageBlocks];
 
   const maxHistoryChars = options.maxHistoryChars ?? MAX_PROJECTED_HISTORY_CHARS;
-  let historyText = historyMessages.map(formatMessageForHistory).filter(Boolean).join("\n\n");
+  let historyText = historyMessages
+    .map(msg => formatMessageForHistory(msg, options.vendorNameByWire))
+    .filter(Boolean)
+    .join("\n\n");
   if (historyText.length > maxHistoryChars) {
     historyText = `[Earlier conversation history truncated for length...]\n\n` +
       historyText.slice(historyText.length - maxHistoryChars);
