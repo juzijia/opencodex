@@ -3,9 +3,9 @@ import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { PassThrough, Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { buildQoderArgs, buildQoderChildEnv, createQoderAdapter, QODER_ASSISTANT_TOOL_QUIET_FALLBACK_MS } from "../../src/adapters/qoder/adapter";
+import { buildQoderArgs, buildQoderChildEnv, createQoderAdapter } from "../../src/adapters/qoder/adapter";
 import { buildConversationInput, mapStreamMessageToEvents, type StreamParseState } from "../../src/adapters/coding-agent/protocol";
-import { runCodingAgentTurn } from "../../src/adapters/coding-agent/turn";
+import { runCodingAgentTurn, type CodingAgentDeps } from "../../src/adapters/coding-agent/turn";
 import { buildCodingAgentToolCatalog, CODING_AGENT_TOOL_LIMITS } from "../../src/adapters/coding-agent/tool-catalog";
 import { buildResponseJSON } from "../../src/bridge/response-json";
 import { clearQoderBinaryCache, QODER_CN_PROFILE, QODER_GLOBAL_PROFILE, QODER_PROFILES, resolveQoderProfile } from "../../src/adapters/qoder/profiles";
@@ -82,7 +82,7 @@ describe("qoder adapter", () => {
         catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
         return fakeChild([
           JSON.stringify({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] }) + "\n",
-          JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: callId,
+          JSON.stringify({ type: "assistant", message: { stop_reason: "tool_use", content: [{ type: "tool_use", id: callId,
             name: "mcp__opencodex__probe_echo", input: { value: "FACT1" } }] } }) + "\n",
         ], { parked: true });
       },
@@ -676,231 +676,86 @@ function setupParkedQoder(tools = ["probe_echo"], overrides: Partial<CodingAgent
   return { spawned, clock, parked, adapter };
 }
 
-describe("qoder quiet fallback", () => {
-  test("1. one tool / parked child advances quiet interval to exactly one done(tool_use) and reaps", async () => {
-    const spawned = Promise.withResolvers<void>();
-    const clock = createTestClock();
-    const parked = createParkedChild();
-    const adapter = createQoderAdapter(provider(), {
-      which: () => "/bin/qoder",
-      spawn: () => {
-        spawned.resolve();
-        return parked.child;
-      },
-      killGraceMs: 10,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    });
-    const events: AdapterEvent[] = [];
-    const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
-
-    await spawned.promise;
-    parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_1", name: "mcp__opencodex__probe_echo", input: { value: "A" } }] },
-    });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-
-    expect(events.filter(e => e.type === "tool_call_start")).toHaveLength(1);
-    expect(events.some(e => e.type === "done")).toBe(false);
-    expect(parked.child.killed).toBe(false);
-
-    await clock.advanceTimersByTime(300);
-    await turnPromise;
-
-    expect(events.filter(e => e.type === "done")).toHaveLength(1);
-    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
-    expect(parked.child.killed).toBe(true);
-  });
-
-  test("2. two split assistant tool frames before 300ms both survive and quiet expiry completes", async () => {
+describe("qoder authoritative tool-turn completion", () => {
+  test("single tool stop_reason completes immediately and reaps with identity/input intact", async () => {
     const { spawned, clock, parked, adapter } = setupParkedQoder();
     const events: AdapterEvent[] = [];
-    const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
-
+    const turn = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
     await spawned.promise;
     parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_split_1", name: "mcp__opencodex__probe_echo", input: { value: "FIRST" } }] },
-    });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-
-    await clock.advanceTimersByTime(150);
-    expect(events.some(e => e.type === "done")).toBe(false);
-
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_split_2", name: "mcp__opencodex__probe_echo", input: { value: "SECOND" } }] },
-    });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-
-    await clock.advanceTimersByTime(250);
-    expect(events.some(e => e.type === "done")).toBe(false);
-
-    await clock.advanceTimersByTime(50);
-    await turnPromise;
-
-    const starts = events.filter(e => e.type === "tool_call_start");
-    expect(starts).toHaveLength(2);
-    expect(starts[0]).toMatchObject({ id: "call_split_1", name: "probe_echo" });
-    expect(starts[1]).toMatchObject({ id: "call_split_2", name: "probe_echo" });
-
-    const deltas = events.filter(e => e.type === "tool_call_delta");
-    expect(deltas).toEqual([
-      { type: "tool_call_delta", arguments: '{"value":"FIRST"}' },
-      { type: "tool_call_delta", arguments: '{"value":"SECOND"}' },
-    ]);
-
-    expect(events.filter(e => e.type === "done")).toHaveLength(1);
-    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
-  });
-
-  test("3. timer reset by intermediate assistant activity keeps both tools alive until new quiet deadline", async () => {
-    const { spawned, clock, parked, adapter } = setupParkedQoder();
-    const events: AdapterEvent[] = [];
-    const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
-
-    await spawned.promise;
-    parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_reset_1", name: "mcp__opencodex__probe_echo", input: { value: "A" } }] },
-    });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-
-    await clock.advanceTimersByTime(200);
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "thinking", thinking: "evaluating next step" }] },
-    });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-
-    await clock.advanceTimersByTime(150);
-    expect(events.some(e => e.type === "done")).toBe(false);
-
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_reset_2", name: "mcp__opencodex__probe_echo", input: { value: "B" } }] },
-    });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-
-    await clock.advanceTimersByTime(299);
-    expect(events.some(e => e.type === "done")).toBe(false);
-
-    await clock.advanceTimersByTime(1);
-    await turnPromise;
-
-    expect(events.filter(e => e.type === "tool_call_start")).toHaveLength(2);
-    expect(events.filter(e => e.type === "done")).toHaveLength(1);
-    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
-  });
-
-  test("4. thinking/text before first tool does not arm quiet fallback timer", async () => {
-    const { spawned, clock, parked, adapter } = setupParkedQoder();
-    const events: AdapterEvent[] = [];
-    const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
-
-    await spawned.promise;
-    parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "thinking", thinking: "thinking first" }] },
-    });
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "text", text: "text second" }] },
-    });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-
-    expect(clock.scheduled.filter(s => s.delay === 300)).toHaveLength(0);
-
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_t1", name: "mcp__opencodex__probe_echo", input: { value: "1" } }] },
-    });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-
-    expect(clock.scheduled.filter(s => s.delay === 300)).toHaveLength(1);
-
-    await clock.advanceTimersByTime(300);
-    await turnPromise;
-    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use" });
-  });
-
-  test("5. authoritative message_stop completes immediately, cancels fallback, emits one done", async () => {
-    const { spawned, clock, parked, adapter } = setupParkedQoder();
-    const events: AdapterEvent[] = [];
-    const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
-
-    await spawned.promise;
-    parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_auth_1", name: "mcp__opencodex__probe_echo", input: { value: "AUTH" } }] },
-    });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-
-    expect(clock.scheduled.filter(s => s.delay === 300)).toHaveLength(1);
-
-    parked.pushFrame({ type: "stream_event", event: { type: "message_stop" } });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-    await turnPromise;
-
+    parked.pushFrame({ type: "assistant", message: { stop_reason: "tool_use", usage: { input_tokens: 12, output_tokens: 3 }, content: [
+      { type: "tool_use", id: "call_1", name: "mcp__opencodex__probe_echo", input: { value: "A" } },
+    ] } });
+    await turn;
     expect(clock.currentTime).toBe(0);
-    expect(clock.scheduled.filter(s => s.delay === 300)).toHaveLength(0);
+    expect(events.filter(e => e.type === "tool_call_start")).toEqual([{ type: "tool_call_start", id: "call_1", name: "probe_echo" }]);
+    expect(events.filter(e => e.type === "tool_call_delta")).toEqual([{ type: "tool_call_delta", arguments: '{"value":"A"}' }]);
+    expect(events.filter(e => e.type === "tool_call_end")).toHaveLength(1);
     expect(events.filter(e => e.type === "done")).toHaveLength(1);
-    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false, usage: { inputTokens: 12, outputTokens: 3 } });
+    expect(parked.child.killed).toBe(true);
+    expect(clock.pendingCount).toBe(0);
   });
 
-  test("6. captured stale timer callback is completely inert after timer reset/cancellation", async () => {
-    const { spawned, clock, parked, adapter } = setupParkedQoder();
-    const events: AdapterEvent[] = [];
-    const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
-
-    await spawned.promise;
-    parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_stale_1", name: "mcp__opencodex__probe_echo", input: { value: "S" } }] },
+  for (const delay of [0, 1000]) {
+    test(`two sibling tools survive ${delay}ms until final stop_reason`, async () => {
+      const { spawned, clock, parked, adapter } = setupParkedQoder();
+      const events: AdapterEvent[] = [];
+      const turn = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
+      await spawned.promise;
+      parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
+      parked.pushFrame({ type: "assistant", message: { stop_reason: null, content: [
+        { type: "tool_use", id: "call_A", name: "mcp__opencodex__probe_echo", input: { value: "A" } },
+      ] } });
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await clock.advanceTimersByTime(delay);
+      expect(events.filter(e => e.type === "tool_call_end")).toHaveLength(1);
+      expect(events.some(e => e.type === "done")).toBe(false);
+      expect(parked.child.killed).toBe(false);
+      parked.pushFrame({ type: "assistant", message: { stop_reason: "tool_use", content: [
+        { type: "tool_use", id: "call_B", name: "mcp__opencodex__probe_echo", input: { value: "B" } },
+      ] } });
+      await turn;
+      expect(clock.currentTime).toBe(delay);
+      expect(events.filter(e => e.type === "tool_call_start")).toEqual([
+        { type: "tool_call_start", id: "call_A", name: "probe_echo" },
+        { type: "tool_call_start", id: "call_B", name: "probe_echo" },
+      ]);
+      expect(events.filter(e => e.type === "tool_call_delta")).toEqual([
+        { type: "tool_call_delta", arguments: '{"value":"A"}' },
+        { type: "tool_call_delta", arguments: '{"value":"B"}' },
+      ]);
+      expect(events.filter(e => e.type === "tool_call_end")).toHaveLength(2);
+      expect(events.filter(e => e.type === "done")).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
+      expect(parked.child.killed).toBe(true);
     });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
+  }
 
-    const staleItem = clock.scheduled.find(s => s.delay === 300)!;
-    expect(staleItem).toBeDefined();
-    const staleCallback = staleItem.callback;
-
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_stale_2", name: "mcp__opencodex__probe_echo", input: { value: "S2" } }] },
+  for (const stopReason of [undefined, null, "end_turn", "max_tokens"]) {
+    test(`silence alone must not complete a tool turn (${stopReason}); EOF fails closed`, async () => {
+      const { spawned, clock, parked, adapter } = setupParkedQoder();
+      const events: AdapterEvent[] = [];
+      const turn = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
+      await spawned.promise;
+      parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
+      parked.pushFrame({ type: "assistant", message: { stop_reason: stopReason, content: [
+        { type: "tool_use", id: "call_no_stop", name: "mcp__opencodex__probe_echo", input: {} },
+      ] } });
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await clock.advanceTimersByTime(1000);
+      expect(events.some(e => e.type === "done")).toBe(false);
+      expect(parked.child.killed).toBe(false);
+      parked.end();
+      await turn;
+      expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error", status: 502 });
+      expect(events.some(e => e.type === "done")).toBe(false);
     });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
+  }
 
-    staleCallback();
-
-    expect(events.some(e => e.type === "done")).toBe(false);
-    expect(parked.child.killed).toBe(false);
-
-    await clock.advanceTimersByTime(300);
-    await turnPromise;
-
-    expect(events.filter(e => e.type === "done")).toHaveLength(1);
-  });
-
-  test("7. abort while armed wins, cancels fallback, and later timer execution is inert", async () => {
+  test("abort while awaiting authoritative stop fails closed", async () => {
     const abortController = new AbortController();
     const { spawned, clock, parked, adapter } = setupParkedQoder();
     const events: AdapterEvent[] = [];
@@ -919,21 +774,18 @@ describe("qoder quiet fallback", () => {
     await new Promise(r => setImmediate(r));
     await new Promise(r => setImmediate(r));
 
-    const timerItem = clock.scheduled.find(s => s.delay === 300)!;
-    const capturedCallback = timerItem.callback;
-
     abortController.abort();
     await turnPromise;
 
     expect(events.some(e => e.type === "error" && e.message.includes("aborted"))).toBe(true);
     expect(events.some(e => e.type === "done")).toBe(false);
 
-    capturedCallback();
+    await clock.advanceTimersByTime(1000);
     expect(events.filter(e => e.type === "done")).toHaveLength(0);
     expect(events.filter(e => e.type === "error")).toHaveLength(1);
   });
 
-  test("8. global timeout while armed wins and fallback cannot emit success", async () => {
+  test("global timeout without authoritative stop cannot emit success", async () => {
     const { spawned, clock, parked, adapter } = setupParkedQoder(["probe_echo"], { timeoutMs: 100 });
     const events: AdapterEvent[] = [];
     const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
@@ -957,7 +809,7 @@ describe("qoder quiet fallback", () => {
     expect(events.filter(e => e.type === "done")).toHaveLength(0);
   });
 
-  test("9. protocol error while armed wins and prevents successful fallback", async () => {
+  test("protocol error before authoritative stop prevents success", async () => {
     const { spawned, clock, parked, adapter } = setupParkedQoder();
     const events: AdapterEvent[] = [];
     const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
@@ -980,7 +832,7 @@ describe("qoder quiet fallback", () => {
     expect(events.some(e => e.type === "done")).toBe(false);
   });
 
-  test("10. undeclared tool call while armed wins with undeclared_tool_call error", async () => {
+  test("undeclared tool call before authoritative stop fails closed", async () => {
     const { spawned, clock, parked, adapter } = setupParkedQoder();
     const events: AdapterEvent[] = [];
     const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
@@ -1006,7 +858,7 @@ describe("qoder quiet fallback", () => {
     expect(events.some(e => e.type === "done")).toBe(false);
   });
 
-  test("11. fallback expiry does not certify success while an incomplete tool block is open", async () => {
+  test("authoritative assistant stop with incomplete tool block fails closed", async () => {
     const { spawned, clock, parked, adapter } = setupParkedQoder();
     const events: AdapterEvent[] = [];
     const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
@@ -1032,10 +884,10 @@ describe("qoder quiet fallback", () => {
     expect(events.some(e => e.type === "done")).toBe(false);
     expect(parked.child.killed).toBe(false);
 
-    parked.end();
+    parked.pushFrame({ type: "assistant", message: { stop_reason: "tool_use", content: [] } });
     await turnPromise;
 
-    expect(events.some(e => e.type === "error")).toBe(true);
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error", status: 502, message: "Coding-agent CLI ended with an incomplete tool call." });
     expect(events.some(e => e.type === "done")).toBe(false);
   });
 
@@ -1050,7 +902,7 @@ describe("qoder quiet fallback", () => {
     for (let i = 0; i < 16; i++) {
       parked.pushFrame({
         type: "assistant",
-        message: { content: [{ type: "tool_use", id: `call_16_${i}`, name: `mcp__opencodex__tool_${i}`, input: { value: String(i) } }] },
+        message: { stop_reason: i === 15 ? "tool_use" : null, content: [{ type: "tool_use", id: `call_16_${i}`, name: `mcp__opencodex__tool_${i}`, input: { value: String(i) } }] },
       });
     }
     await new Promise(r => setImmediate(r));
@@ -1067,7 +919,7 @@ describe("qoder quiet fallback", () => {
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
   });
 
-  test("13. scaffold refusal suppresses fallback success terminal", async () => {
+  test("scaffold refusal suppresses authoritative success terminal", async () => {
     const { spawned, clock, parked, adapter } = setupParkedQoder();
     const events: AdapterEvent[] = [];
     const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
@@ -1080,7 +932,7 @@ describe("qoder quiet fallback", () => {
     });
     parked.pushFrame({
       type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_scaffold_1", name: "mcp__opencodex__probe_echo", input: { value: "S" } }] },
+      message: { stop_reason: "tool_use", content: [{ type: "tool_use", id: "call_scaffold_1", name: "mcp__opencodex__probe_echo", input: { value: "S" } }] },
     });
     await new Promise(r => setImmediate(r));
     await new Promise(r => setImmediate(r));
@@ -1092,7 +944,7 @@ describe("qoder quiet fallback", () => {
     expect(events.at(-1)).toMatchObject({ type: "error", status: 502, code: "vendor_scaffold_detected" });
   });
 
-  test("14. required tool without tool call does not arm fallback and fails with tool_call_required", async () => {
+  test("required tool without tool call fails with tool_call_required", async () => {
     const { spawned, clock, parked, adapter } = setupParkedQoder();
     const events: AdapterEvent[] = [];
     const req = parsed({
@@ -1119,105 +971,4 @@ describe("qoder quiet fallback", () => {
     expect(events.at(-1)).toMatchObject({ type: "error", code: "tool_call_required", status: 502 });
   });
 
-  test("15. fallback omitted verifies future exit path: authoritative message_stop works without timer", async () => {
-    const clock = createTestClock();
-    const parked = createParkedChild();
-    const spawned = Promise.withResolvers<void>();
-    const req = toolRequest();
-    const catalog = [{ name: "probe_echo", description: "Echo", inputSchema: { type: "object" } }];
-    const events: AdapterEvent[] = [];
-    const turnPromise = runCodingAgentTurn({
-      profiles: QODER_PROFILES,
-      provider: provider(),
-      parsed: req,
-      incoming: { headers: new Headers(), translatorBudget: createTestTranslatorBudget() },
-      emit: e => events.push(e),
-      buildArgs: () => [],
-      buildEnv: () => ({}),
-      deps: {
-        which: () => "/bin/qoder",
-        spawn: () => {
-          spawned.resolve();
-          return parked.child;
-        },
-        killGraceMs: 10,
-        setTimeout: clock.setTimeout,
-        clearTimeout: clock.clearTimeout,
-      },
-      toolBridge: {
-        serverName: "opencodex",
-        serverModulePath: "/fake/path",
-        tools: catalog,
-        emittedNameMap: new Map([["mcp__opencodex__probe_echo", "probe_echo"]]),
-        maxTurnToolCalls: 16,
-        completeAssistantToolUse: true,
-        // assistantToolQuietFallbackMs is omitted
-      },
-    });
-
-    await spawned.promise;
-    parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
-    parked.pushFrame({
-      type: "assistant",
-      message: { content: [{ type: "tool_use", id: "call_no_fb", name: "mcp__opencodex__probe_echo", input: { value: "NO_FB" } }] },
-    });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-
-    expect(clock.scheduled.filter(s => s.delay === 300)).toHaveLength(0);
-    expect(events.some(e => e.type === "done")).toBe(false);
-
-    parked.pushFrame({ type: "stream_event", event: { type: "message_stop" } });
-    await new Promise(r => setImmediate(r));
-    await new Promise(r => setImmediate(r));
-    await turnPromise;
-
-    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
-    expect(clock.scheduled.filter(s => s.delay === 300)).toHaveLength(0);
-  });
-
-  test("16. across success, error, abort, and timeout: no timer survives and no double terminal", async () => {
-    // 16a. Success path
-    {
-      const { spawned, clock, parked, adapter } = setupParkedQoder();
-      const events: AdapterEvent[] = [];
-      const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
-      await spawned.promise;
-      parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
-      parked.pushFrame({
-        type: "assistant",
-        message: { content: [{ type: "tool_use", id: "call_cl_1", name: "mcp__opencodex__probe_echo", input: {} }] },
-      });
-      await new Promise(r => setImmediate(r));
-      await new Promise(r => setImmediate(r));
-      await clock.advanceTimersByTime(300);
-      await turnPromise;
-
-      expect(clock.scheduled.filter(s => s.delay === 300)).toHaveLength(0);
-      const terminals = events.filter(e => e.type === "done" || e.type === "error");
-      expect(terminals).toHaveLength(1);
-    }
-
-    // 16b. Abort path
-    {
-      const ac = new AbortController();
-      const { spawned, clock, parked, adapter } = setupParkedQoder();
-      const events: AdapterEvent[] = [];
-      const turnPromise = adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget(), abortSignal: ac.signal }, e => events.push(e));
-      await spawned.promise;
-      parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
-      parked.pushFrame({
-        type: "assistant",
-        message: { content: [{ type: "tool_use", id: "call_cl_2", name: "mcp__opencodex__probe_echo", input: {} }] },
-      });
-      await new Promise(r => setImmediate(r));
-      await new Promise(r => setImmediate(r));
-      ac.abort();
-      await turnPromise;
-
-      expect(clock.scheduled.filter(s => s.delay === 300)).toHaveLength(0);
-      const terminals = events.filter(e => e.type === "done" || e.type === "error");
-      expect(terminals).toHaveLength(1);
-    }
-  });
 });

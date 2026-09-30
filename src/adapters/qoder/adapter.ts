@@ -13,9 +13,6 @@ export type QoderAdapterDeps = CodingAgentDeps;
 const QODER_MCP_SERVER_NAME = "opencodex";
 const QODER_MCP_SERVER_PATH = fileURLToPath(new URL("../coding-agent/mcp-server.ts", import.meta.url));
 
-/** Resettable quiet fallback window (ms) for completing multi-tool assistant turns without message_stop. */
-export const QODER_ASSISTANT_TOOL_QUIET_FALLBACK_MS = 300;
-
 export function buildQoderChildEnv(profile: QoderProfile, apiKey: string, systemPrompt?: string): Record<string, string> {
   const promptEnv = profile.region === "cn" ? "QODERCN_APPEND_SYSTEM_PROMPT" : "QODER_APPEND_SYSTEM_PROMPT";
   return { ...baseScopedEnv(), NO_COLOR: "1", [profile.tokenEnv]: apiKey,
@@ -153,7 +150,7 @@ export function createQoderAdapter(provider: OcxProviderConfig, deps: QoderAdapt
             emittedNameMap: catalog.emittedNameMap,
             maxTurnToolCalls: MAX_TOOL_BLOCK_STARTS,
             completeAssistantToolUse: true,
-            assistantToolQuietFallbackMs: QODER_ASSISTANT_TOOL_QUIET_FALLBACK_MS,
+            toolTurnCompletionSignal: "assistant_tool_use_stop",
             allowedToolsFlag: "--allowed-tools",
             standaloneEntrypoint: "__qoder-mcp",
             requireToolCall: catalog.requireToolCall,

@@ -227,6 +227,8 @@ export interface StreamParseState {
   sawTerminalResult: boolean;
   /** A `message_stop` stream event arrived: the assistant message is complete. */
   sawMessageStop?: boolean;
+  /** The final complete assistant block explicitly ends a tool-use response. */
+  sawAssistantToolUseStop?: boolean;
   /**
    * Open tool_use blocks keyed by content-block index. CodeBuddy parallel tool calls arrive
    * as several tool_use blocks on ONE shared content-block index — intermediate blocks never
@@ -285,6 +287,7 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
     // Fallback path: a complete assistant message. Surface text and thinking independently
     // only when the partial delta stream did not already carry them (§十二).
     const messageRecord = asRecord(message.message);
+    if (messageRecord?.stop_reason === "tool_use") state.sawAssistantToolUseStop = true;
     const content = messageRecord?.content;
     if (Array.isArray(content)) {
       for (const block of content) {
@@ -303,6 +306,12 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
             const name = asString(part.name);
             const input = asRecord(part.input);
             if (!id || !name || !input) throw new CodingAgentProtocolError("Coding-agent CLI returned a tool call without structured identity and input.");
+            const limit = Math.min(MAX_TOOL_BLOCK_STARTS, state.maxToolBlockStarts ?? MAX_TOOL_BLOCK_STARTS);
+            if ((state.toolBlockStarts ?? 0) >= limit) {
+              state.toolCallLimitExceeded = true;
+              return events;
+            }
+            state.toolBlockStarts = (state.toolBlockStarts ?? 0) + 1;
             events.push(
               { type: "tool_call_start", id, name },
               { type: "tool_call_delta", arguments: JSON.stringify(input) },

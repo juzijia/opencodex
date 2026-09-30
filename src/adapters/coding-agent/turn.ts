@@ -138,8 +138,8 @@ export interface CodingAgentToolBridgeInput {
   maxTurnToolCalls: number;
   /** Finish the turn when a complete assistant frame supplies structured tool_use blocks. */
   completeAssistantToolUse?: boolean;
-  /** Optional quiet fallback window (ms) for completing tool legs without message_stop. */
-  assistantToolQuietFallbackMs?: number;
+  /** Authoritative tool-turn stop signal; existing coding-agent bridges default to message_stop. */
+  toolTurnCompletionSignal?: "message_stop" | "assistant_tool_use_stop";
   /** Family-specific CLI flag spelling and compiled MCP helper entrypoint. */
   allowedToolsFlag?: string;
   standaloneEntrypoint?: string;
@@ -329,18 +329,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   });
 
   let terminalEmitted = false;
-  let quietFallbackTimer: ReturnType<typeof setTimeout> | undefined;
-  const cancelQuietFallback = (): void => {
-    if (quietFallbackTimer !== undefined) {
-      clearTimeoutFn(quietFallbackTimer);
-      quietFallbackTimer = undefined;
-    }
-  };
   const emitOnce = (event: AdapterEvent): void => {
     if (event.type === "done" || event.type === "error" || event.type === "incomplete") {
       if (terminalEmitted) return;
       terminalEmitted = true;
-      cancelQuietFallback();
     }
     emit(event);
   };
@@ -349,7 +341,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   let killed = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   const kill = (): void => {
-    cancelQuietFallback();
     if (killed || child.killed) return;
     killed = true;
     if (platform === "win32" && child.pid !== undefined) {
@@ -371,7 +362,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     try { child.stdout?.destroy(); } catch { /* already closed */ }
   };
   const onAbort = (): void => {
-    cancelQuietFallback();
     kill();
     stopStream();
   };
@@ -389,7 +379,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
 
   const cleanup = (): void => {
     clearTimeoutFn(timeoutTimer);
-    cancelQuietFallback();
     incoming.abortSignal?.removeEventListener("abort", onAbort);
     try { child.stdin?.destroy(); } catch { /* ignore */ }
     // Termination is owned by the reap step below, not here: killing in cleanup would set
@@ -401,8 +390,8 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
   let turnError: string | undefined;
   let failClosed = false;
   // A successful result frame that arrived after every captured tool call completed but
-  // before message_stop. The bridge contract still ends the leg with the synthesized
-  // done(tool_use) at message_stop, so the result-derived done(stop) is deferred and its
+  // before an authoritative tool-turn stop. The bridge contract still ends the leg with
+  // synthesized done(tool_use) at that stop, so result-derived done(stop) is deferred and its
   // usage (authoritative vendor accounting) is folded into the synthesis. Set inside the
   // stream loop; read by the synthesis and the stream-end error selection below.
   let deferredResultDone: Extract<AdapterEvent, { type: "done" }> | undefined;
@@ -416,44 +405,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     strictToolBlockCapture: Boolean(toolBridge),
     partialToolCallIds: toolBridge ? new Set<string>() : undefined,
     completeAssistantToolUse: toolBridge?.completeAssistantToolUse,
-  };
-
-  const fallbackMs = toolBridge?.assistantToolQuietFallbackMs;
-
-  const onQuietFallbackExpiry = (timer: ReturnType<typeof setTimeout>): void => {
-    if (quietFallbackTimer !== timer) return;
-    quietFallbackTimer = undefined;
-
-    if (terminalEmitted) return;
-    if (incoming.abortSignal?.aborted) return;
-    if (state.sawMessageStop) return;
-    if ((state.completedToolCalls ?? 0) <= 0) return;
-    if (
-      (state.openToolBlocks?.size ?? 0) > 0
-      || ((state.toolBlockStarts ?? 0) > 0 && (state.completedToolCalls ?? 0) !== (state.toolBlockStarts ?? 0))
-    ) {
-      return;
-    }
-    if (failClosed || streamProtocolError !== undefined || turnError !== undefined) return;
-
-    const terminalUsage = deferredResultDone?.usage ?? state.partialUsage;
-    emitOnce({
-      type: "done",
-      stopReason: "tool_use",
-      endTurn: false,
-      ...(terminalUsage ? { usage: terminalUsage } : {}),
-    });
-    kill();
-    stopStream();
-  };
-
-  const scheduleQuietFallback = (): void => {
-    if (fallbackMs === undefined || fallbackMs <= 0) return;
-    cancelQuietFallback();
-    const timer = setTimeoutFn(() => {
-      onQuietFallbackExpiry(timer);
-    }, fallbackMs);
-    quietFallbackTimer = timer;
   };
 
   try {
@@ -519,7 +470,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             break;
           }
         }
-        const completedCallsBefore = state.completedToolCalls ?? 0;
         const mappedEvents = mapStreamMessageToEvents(message, state);
         if (state.toolCallLimitExceeded) {
           emitOnce({
@@ -635,9 +585,9 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             // Every captured call completed and the CLI settled with a successful result before
             // message_stop (instead of parking on the never-answering capture server). Emitting
             // this done(stop) now would end the turn as a text completion and skip the
-            // synthesized done(tool_use) the client contract expects. Defer it: message_stop
-            // synthesis emits the terminal event with this frame's usage, and a stream that
-            // ends without message_stop fails closed with protocol_error below.
+            // synthesized done(tool_use) the client contract expects. Defer it: an authoritative
+            // tool-turn stop synthesizes the terminal event with this frame's usage, and a stream
+            // that ends without a stop fails closed with protocol_error below.
             deferredResultDone = event;
             continue;
           }
@@ -646,15 +596,17 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             : event);
         }
         if (failClosed) break;
-        const newlyCompletedCalls = (state.completedToolCalls ?? 0) - completedCallsBefore;
+        const toolTurnCompletionSignal = toolBridge?.toolTurnCompletionSignal ?? "message_stop";
+        const sawToolTurnStop = toolTurnCompletionSignal === "assistant_tool_use_stop"
+          ? state.sawAssistantToolUseStop === true
+          : state.sawMessageStop === true;
         if (
           toolBridge
           && !terminalEmitted
-          && state.sawMessageStop
+          && sawToolTurnStop
           && (state.toolBlockStarts ?? 0) > 0
           && (state.completedToolCalls ?? 0) !== (state.toolBlockStarts ?? 0)
         ) {
-          cancelQuietFallback();
           emitOnce({
             type: "error",
             message: "Coding-agent CLI ended with an incomplete tool call.",
@@ -666,10 +618,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           kill();
           break;
         }
-        if (toolBridge && !terminalEmitted && state.sawMessageStop && (state.completedToolCalls ?? 0) > 0) {
-          cancelQuietFallback();
+        if (toolBridge && !terminalEmitted && sawToolTurnStop && (state.toolBlockStarts ?? 0) > 0
+          && (state.completedToolCalls ?? 0) === (state.toolBlockStarts ?? 0)) {
           // The raw-start gate above already refused any call opened before the handshake.
-          // The capture-only MCP handler never answers, so the CLI parks after message_stop.
+          // The capture-only MCP handler never answers, so the CLI parks after the tool-turn stop.
           // The completed tool_use blocks are this turn's structured output: end the leg here
           // and terminate the tree; the client executes, and the next request continues.
           // Pre-result usage snapshots keep this terminated leg accountable: no result frame
@@ -683,19 +635,6 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
           });
           kill();
           break;
-        }
-        if (
-          fallbackMs !== undefined
-          && fallbackMs > 0
-          && !terminalEmitted
-          && !state.sawMessageStop
-          && message.type === "assistant"
-        ) {
-          if (quietFallbackTimer !== undefined) {
-            scheduleQuietFallback();
-          } else if (newlyCompletedCalls > 0) {
-            scheduleQuietFallback();
-          }
         }
         if (terminalEmitted) break;
       }

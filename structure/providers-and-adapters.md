@@ -20,8 +20,8 @@ and argument fragments charge the request's translator budget while buffered; cl
 replacement, and turn cleanup release those reservations. A new start on an occupied
 index closes the previous block only when its arguments form a complete JSON object;
 an unindexed delta or stop cannot be attributed to an indexed block, and a nonempty
-argument delta that cannot be attributed fails immediately. Turn completion
-requires every opened block to close, preserving the downstream single-open-call contract.
+argument delta that cannot be attributed fails immediately. Tool-bridge completion requires every opened block to close, preserving the downstream single-open-call contract.
+The authoritative completion signal is adapter-selected: existing shared coding-agent bridges default to `message_stop`, while Qoder selects only the final complete assistant frame's `message.stop_reason === "tool_use"` (its last sibling only). Qoder does not treat `message_stop` as its completion signal. Silence never ends the tool leg. An incomplete call fails closed with `protocol_error`; otherwise the bridge emits one `done(tool_use)` with usage and terminates the parked CLI; the external client owns execution.
 An indexless argument delta belongs to the sole open block; with multiple blocks open,
 the parser fails the turn before releasing their buffered calls.
 The capture-only bridge checks each raw tool-use start against the init handshake before
