@@ -944,6 +944,38 @@ describe("qoder authoritative tool-turn completion", () => {
     expect(events.at(-1)).toMatchObject({ type: "error", status: 502, code: "vendor_scaffold_detected" });
   });
 
+  test("EOF after a non-selected message_stop still fails without Qoder stop_reason", async () => {
+    const { spawned, parked, adapter } = setupParkedQoder();
+    const events: AdapterEvent[] = [];
+    const turnPromise = adapter.runTurn!(
+      toolRequest(),
+      { headers: new Headers(), translatorBudget: createTestTranslatorBudget() },
+      e => events.push(e),
+    );
+
+    await spawned.promise;
+    parked.pushFrame({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
+    parked.pushFrame({
+      type: "assistant",
+      message: {
+        stop_reason: null,
+        content: [{ type: "tool_use", id: "call_eof_1", name: "mcp__opencodex__probe_echo", input: { value: "EOF" } }],
+      },
+    });
+    parked.pushFrame({ type: "result", subtype: "success", is_error: false });
+    parked.pushFrame({ type: "stream_event", event: { type: "message_stop" } });
+    parked.end();
+    await turnPromise;
+
+    expect(events.some(e => e.type === "done")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      code: "protocol_error",
+      status: 502,
+      message: expect.stringContaining("authoritative tool-turn stop"),
+    });
+  });
+
   test("required tool without tool call fails with tool_call_required", async () => {
     const { spawned, clock, parked, adapter } = setupParkedQoder();
     const events: AdapterEvent[] = [];

@@ -406,6 +406,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     partialToolCallIds: toolBridge ? new Set<string>() : undefined,
     completeAssistantToolUse: toolBridge?.completeAssistantToolUse,
   };
+  const toolTurnCompletionSignal = toolBridge?.toolTurnCompletionSignal ?? "message_stop";
+  const sawSelectedToolTurnStop = (): boolean => toolTurnCompletionSignal === "assistant_tool_use_stop"
+    ? state.sawAssistantToolUseStop === true
+    : state.sawMessageStop === true;
 
   try {
     // Write the replayed conversation, then close stdin so a single-shot turn can complete.
@@ -596,10 +600,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             : event);
         }
         if (failClosed) break;
-        const toolTurnCompletionSignal = toolBridge?.toolTurnCompletionSignal ?? "message_stop";
-        const sawToolTurnStop = toolTurnCompletionSignal === "assistant_tool_use_stop"
-          ? state.sawAssistantToolUseStop === true
-          : state.sawMessageStop === true;
+        const sawToolTurnStop = sawSelectedToolTurnStop();
         if (
           toolBridge
           && !terminalEmitted
@@ -709,10 +710,10 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
         code: "process_exit_error",
         retryable: false,
       });
-    } else if (toolBridge && deferredResultDone !== undefined && !state.sawMessageStop) {
+    } else if (toolBridge && deferredResultDone !== undefined && !sawSelectedToolTurnStop()) {
       emitOnce({
         type: "error",
-        message: `${profile.label} CLI delivered a terminal result before message_stop on a tool-bridge turn.`,
+        message: `${profile.label} CLI delivered a terminal result before the authoritative tool-turn stop on a tool-bridge turn.`,
         status: 502,
         errorType: "upstream_error",
         code: "protocol_error",
