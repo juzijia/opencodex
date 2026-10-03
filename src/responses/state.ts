@@ -1243,8 +1243,8 @@ export function rememberResponseState(
   // A client-owned function call needs its call_id and preceding input when Codex sends
   // only function_call_output with previous_response_id on the next store:false request.
   const hasFunctionCall = hasPendingFunctionCall(response.output);
-  if (request.store === false && !opts?.force && !hasFunctionCall) return;
-  const unforcedStoreFalse = request.store === false && !opts?.force ? true : undefined;
+  const unforcedStoreFalse = request.store === false && !opts?.force;
+  if (unforcedStoreFalse && !hasFunctionCall) return;
   if (response.status === "incomplete") {
     const details = response.incomplete_details;
     if (!details || typeof details !== "object" || Array.isArray(details)

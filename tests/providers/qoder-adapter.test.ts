@@ -5,10 +5,10 @@ import { PassThrough, Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { buildQoderArgs, buildQoderChildEnv, createQoderAdapter } from "../../src/adapters/qoder/adapter";
 import { buildConversationInput, mapStreamMessageToEvents, type StreamParseState } from "../../src/adapters/coding-agent/protocol";
-import { runCodingAgentTurn, type CodingAgentDeps } from "../../src/adapters/coding-agent/turn";
+import type { CodingAgentDeps } from "../../src/adapters/coding-agent/turn";
 import { buildCodingAgentToolCatalog, CODING_AGENT_TOOL_LIMITS } from "../../src/adapters/coding-agent/tool-catalog";
 import { buildResponseJSON } from "../../src/bridge/response-json";
-import { clearQoderBinaryCache, QODER_CN_PROFILE, QODER_GLOBAL_PROFILE, QODER_PROFILES, resolveQoderProfile } from "../../src/adapters/qoder/profiles";
+import { clearQoderBinaryCache, QODER_CN_PROFILE, QODER_GLOBAL_PROFILE, resolveQoderProfile } from "../../src/adapters/qoder/profiles";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
 
@@ -612,22 +612,8 @@ function createTestClock() {
 }
 
 function createParkedChild() {
-  const child = new EventEmitter() as ChildProcess & { killed: boolean; exitCode: number | null };
-  const stdout = new PassThrough();
-  child.stdout = stdout;
-  child.stderr = Readable.from([]);
-  child.stdin = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
-  child.killed = false;
-  child.exitCode = null;
-  child.kill = () => {
-    child.killed = true;
-    child.exitCode = 0;
-    queueMicrotask(() => {
-      stdout.destroy();
-      child.emit("close", 0);
-    });
-    return true;
-  };
+  const child = fakeChild([], { parked: true }) as ChildProcess & { killed: boolean; exitCode: number | null };
+  const stdout = child.stdout as PassThrough;
   return {
     child,
     pushFrame: (obj: Record<string, unknown>) => {
@@ -802,7 +788,7 @@ describe("qoder authoritative tool-turn completion", () => {
     await clock.advanceTimersByTime(100);
     await turnPromise;
 
-    expect(events.some(e => e.type === "error" && (e as any).code === "timeout")).toBe(true);
+    expect(events.some(e => e.type === "error" && e.code === "timeout")).toBe(true);
     expect(events.some(e => e.type === "done")).toBe(false);
 
     await clock.advanceTimersByTime(200);

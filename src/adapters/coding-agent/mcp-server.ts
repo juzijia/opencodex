@@ -20,7 +20,7 @@ export async function serveCodingAgentMcpTools(tools: CodingAgentMcpTool[], serv
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
   server.setRequestHandler(CallToolRequestSchema, async request => {
     if (!names.has(request.params.name)) throw new Error("unknown isolated tool");
-    return await new Promise<never>(() => {});
+    return new Promise<never>(() => {});
   });
   await server.connect(new StdioServerTransport());
 }
