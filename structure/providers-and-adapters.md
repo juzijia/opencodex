@@ -63,16 +63,12 @@ Failure prevents CLI spawn and settles the bridge's private directory; the CodeB
 also settles its prompt-file directory. Catalog and MCP-config write failures cover both owners.
 In a compiled executable, the bridge launches the private `__codebuddy-mcp` CLI entrypoint;
 source execution launches the MCP module with Bun. Both paths advertise only the request's
-isolated catalog and leave tool execution to the external client. Qoder's selected catalog projection in
-`src/adapters/coding-agent/tool-catalog.ts` rejects empty, control-bearing, comma-bearing, or unpaired-surrogate
+isolated catalog and leave tool execution to the external client. Qoder's selected catalog projection in `src/adapters/coding-agent/tool-catalog.ts` rejects empty, control-bearing, comma-bearing, or unpaired-surrogate
 name/namespace components and wire names over 512 UTF-8 bytes before staging. It admits at most 128 selected tools,
-256 KiB per serialized definition, and 2 MiB for the serialized array (including brackets and separators); the
-comma-joined `--allowed-tools` argument is separately capped at 8 KiB of UTF-8, counting full
-`mcp__<server>__<tool>` names and commas. Invalid catalogs return a fixed local 400 without spawning Qoder. Valid
-wire identities, order and schemas are unchanged, apart from the Responses-only encrypted marker stripped during
+256 KiB per serialized definition, and 2 MiB for the serialized array (including brackets and separators); the comma-joined `--allowed-tools` argument is separately capped at 8 KiB of UTF-8, counting full
+`mcp__<server>__<tool>` names and commas. Invalid catalogs return a fixed local 400 without spawning Qoder. Valid wire identities, order and schemas are unchanged, apart from the Responses-only encrypted marker stripped during
 projection. Duplicate and ambiguous wire identities remain the Responses parser's responsibility. Qoder appends the
-folded system prompt through its documented scoped `QODER_APPEND_SYSTEM_PROMPT` or `QODERCN_APPEND_SYSTEM_PROMPT`
-child environment, never through command-line arguments or inherited vendor variables.
+folded system prompt through its documented scoped `QODER_APPEND_SYSTEM_PROMPT` or `QODERCN_APPEND_SYSTEM_PROMPT` child environment, never through command-line arguments or inherited vendor variables.
 
 Coding-agent stdout is framed as bounded JSONL directly from decoded stream segments. The framer
 tracks the current line's UTF-8 byte count incrementally, searches each decoded segment once, and
