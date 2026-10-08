@@ -136,6 +136,8 @@ export interface CodingAgentToolBridgeInput {
   emittedNameMap: Map<string, string>;
   /** Tool_use blocks accepted in one assistant message. */
   maxTurnToolCalls: number;
+  /** Render prior tool calls with the CLI-emitted names. Off by default so CodeBuddy history is unchanged. */
+  projectHistoryToolNames?: boolean;
   /** Finish the turn when a complete assistant frame supplies structured tool_use blocks. */
   completeAssistantToolUse?: boolean;
   /** Authoritative tool-turn stop signal; existing coding-agent bridges default to message_stop. */
@@ -423,7 +425,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
       const historyCharLimit = projectedHistoryCharLimit(
         modelRecordValue(provider.modelContextWindows, parsed.modelId) ?? provider.contextWindow,
       );
-      const vendorNameByWire = toolBridge?.emittedNameMap
+      const vendorNameByWire = toolBridge?.projectHistoryToolNames
         ? new Map([...toolBridge.emittedNameMap].map(([emitted, wire]) => [wire, emitted]))
         : undefined;
       for (const line of buildConversationInput(parsed, { maxHistoryChars: historyCharLimit, vendorNameByWire })) stdin.write(`${line}\n`);

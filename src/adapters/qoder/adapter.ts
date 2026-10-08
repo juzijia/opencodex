@@ -150,6 +150,7 @@ export function createQoderAdapter(provider: OcxProviderConfig, deps: QoderAdapt
             tools: catalog.tools,
             emittedNameMap: catalog.emittedNameMap,
             maxTurnToolCalls: MAX_TOOL_BLOCK_STARTS,
+            projectHistoryToolNames: true,
             completeAssistantToolUse: true,
             toolTurnCompletionSignal: "assistant_tool_use_stop",
             allowedToolsFlag: "--allowed-tools",

@@ -661,7 +661,8 @@ function formatMessageForHistory(message: OcxMessage, vendorNameByWire?: Readonl
       } else if (part.type === "thinking" && part.thinking.trim()) {
         parts.push(`[Thinking: ${part.thinking.trim()}]`);
       } else if (part.type === "toolCall") {
-        const wireName = namespacedToolName(part.namespace, part.name);
+        // Without a vendor map the history keeps the bare request name, byte-for-byte as before.
+        const wireName = vendorNameByWire ? namespacedToolName(part.namespace, part.name) : part.name;
         const name = vendorNameByWire?.get(wireName) ?? wireName;
         const args = JSON.stringify(part.arguments ?? {});
         parts.push(`[Tool call: ${name} (call_id: ${part.id}) with args: ${args}]`);
