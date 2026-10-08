@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { PassThrough, Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { buildQoderArgs, buildQoderChildEnv, createQoderAdapter } from "../../src/adapters/qoder/adapter";
-import { buildConversationInput, mapStreamMessageToEvents, type StreamParseState } from "../../src/adapters/coding-agent/protocol";
+import { buildConversationInput, mapStreamMessageToEvents, releaseOpenToolBlocks, type StreamParseState } from "../../src/adapters/coding-agent/protocol";
 import type { CodingAgentDeps } from "../../src/adapters/coding-agent/turn";
 import { buildCodingAgentToolCatalog, CODING_AGENT_TOOL_LIMITS } from "../../src/adapters/coding-agent/tool-catalog";
 import { buildResponseJSON } from "../../src/bridge/response-json";
@@ -49,6 +49,100 @@ function fakeChild(frames: string[], options: { parked?: boolean } = {}): ChildP
 }
 
 describe("qoder adapter", () => {
+  test.each([false, true])("complete tool calls before init fail closed (late init=%s)", async lateInit => {
+    const frames: unknown[] = [{ type: "assistant", message: { stop_reason: "tool_use", content: [
+      { type: "tool_use", id: "call_pre_init", name: "mcp__opencodex__probe_echo", input: {} },
+    ] } }];
+    if (lateInit) frames.push({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] });
+    const child = fakeChild(frames.map(frame => JSON.stringify(frame) + "\n"), { parked: true });
+    const adapter = createQoderAdapter(provider(), { which: () => "/bin/qoder", spawn: () => child });
+    const events: AdapterEvent[] = [];
+    const budget = createTestTranslatorBudget();
+    await adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: budget }, e => events.push(e));
+    expect(events).toEqual([expect.objectContaining({ type: "error", code: "tool_bridge_init_missing", status: 502 })]);
+    expect(child.killed).toBe(true);
+    expect(budget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0 });
+  });
+
+  for (const field of ["id", "name", "arguments", "turn"] as const) {
+    test(`complete tool ${field} overflow uses translation_buffer_limit and releases leases`, async () => {
+      const block = { type: "tool_use", id: "call_budget", name: "mcp__opencodex__probe_echo", input: { value: "ok" } };
+      if (field === "id") block.id = "x".repeat(65);
+      if (field === "name") block.name = "x".repeat(65);
+      if (field === "arguments") block.input.value = "x".repeat(65);
+      const child = fakeChild([
+        JSON.stringify({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] }) + "\n",
+        JSON.stringify({ type: "assistant", message: { stop_reason: "tool_use", content: [block] } }) + "\n",
+      ], { parked: true });
+      const adapter = createQoderAdapter(provider(), { which: () => "/bin/qoder", spawn: () => child });
+      const budget = createTestTranslatorBudget(field === "turn" ? { maxTurnBytes: 40 } : { maxCallArgumentBytes: 64 });
+      const events: AdapterEvent[] = [];
+      await adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: budget }, e => events.push(e));
+      expect(events).toEqual([expect.objectContaining({ type: "error", code: "translation_buffer_limit", status: 502 })]);
+      expect(child.killed).toBe(true);
+      expect(budget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0, overflows: 1 });
+    });
+  }
+
+  test("repeated complete snapshots emit once, retain bounded identity, and release on cleanup", () => {
+    const budget = createTestTranslatorBudget();
+    const state: StreamParseState = {
+      sawPartialText: false, sawPartialThinking: false, sawTerminalResult: false,
+      completeAssistantToolUse: true, partialToolCallIds: new Set(), translatorBudget: budget,
+      maxToolBlockStarts: 1,
+    };
+    const frame = { type: "assistant", message: { content: [
+      { type: "tool_use", id: "call_snapshot", name: "mcp__opencodex__probe_echo", input: { value: "A" } },
+    ] } };
+    expect(mapStreamMessageToEvents(frame, state).map(event => event.type)).toEqual(["tool_call_start", "tool_call_delta", "tool_call_end"]);
+    const retained = budget.snapshot();
+    expect(retained.currentBytes).toBeGreaterThanOrEqual(Buffer.byteLength("call_snapshotmcp__opencodex__probe_echo") + Buffer.byteLength('{"value":"A"}'));
+    expect(mapStreamMessageToEvents(structuredClone(frame), state)).toEqual([]);
+    expect(budget.snapshot()).toEqual(retained);
+    expect(state.toolBlockStarts).toBe(1);
+    expect(state.completedToolCalls).toBe(1);
+    expect(state.toolCallLimitExceeded).toBeUndefined();
+    releaseOpenToolBlocks(state);
+    expect(budget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0 });
+  });
+
+  test.each(["name", "input"])("conflicting complete snapshot %s reuse fails with protocol_error", async field => {
+    const first = { type: "tool_use", id: "call_reused", name: "mcp__opencodex__probe_echo", input: { value: "A" } };
+    const second = structuredClone(first);
+    if (field === "name") second.name = "mcp__opencodex__other";
+    else second.input.value = "B";
+    const child = fakeChild([
+      JSON.stringify({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] }) + "\n",
+      JSON.stringify({ type: "assistant", message: { content: [first] } }) + "\n",
+      JSON.stringify({ type: "assistant", message: { stop_reason: "tool_use", content: [second] } }) + "\n",
+    ], { parked: true });
+    const adapter = createQoderAdapter(provider(), { which: () => "/bin/qoder", spawn: () => child });
+    const budget = createTestTranslatorBudget();
+    const events: AdapterEvent[] = [];
+    await adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: budget }, e => events.push(e));
+    expect(events.filter(event => event.type === "tool_call_start")).toEqual([{ type: "tool_call_start", id: "call_reused", name: "probe_echo" }]);
+    expect(events.filter(event => event.type === "tool_call_delta")).toEqual([{ type: "tool_call_delta", arguments: '{"value":"A"}' }]);
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error", status: 502 });
+    expect(events.some(event => event.type === "done")).toBe(false);
+    expect(budget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0 });
+  });
+
+  test("repeated snapshot at the authoritative stop completes a single call", async () => {
+    const call = { type: "tool_use", id: "call_repeat", name: "mcp__opencodex__probe_echo", input: {} };
+    const child = fakeChild([
+      JSON.stringify({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] }) + "\n",
+      JSON.stringify({ type: "assistant", message: { content: [call] } }) + "\n",
+      JSON.stringify({ type: "assistant", message: { stop_reason: "tool_use", content: [call] } }) + "\n",
+    ], { parked: true });
+    const adapter = createQoderAdapter(provider(), { which: () => "/bin/qoder", spawn: () => child });
+    const events: AdapterEvent[] = [];
+    const budget = createTestTranslatorBudget();
+    await adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: budget }, e => events.push(e));
+    expect(events.map(event => event.type)).toEqual(["tool_call_start", "tool_call_delta", "tool_call_end", "done"]);
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
+    expect(budget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0 });
+  });
+
   test("normalizes the observed complete assistant tool_use without replacing its native ID", () => {
     const state: StreamParseState = {
       sawPartialText: false, sawPartialThinking: false, sawTerminalResult: false,

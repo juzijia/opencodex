@@ -1,15 +1,15 @@
 /**
- * Closed provenance and replay gating for unforced store:false function call responses.
+ * Closed provenance and replay gating for unforced store:false client tool call responses.
  *
  * An unforced store:false response is cached exclusively to allow the client to send a matching
- * function_call_output continuation on the next turn. Normal replay, text continuation, or
+ * function/custom tool output continuation on the next turn. Normal replay, text continuation, or
  * mismatched output without a matching pending call fails replay and requires the client to
  * supply the full conversation.
  */
 
-export function hasPendingFunctionCall(output: readonly unknown[]): boolean {
+export function hasPendingClientToolCall(output: readonly unknown[]): boolean {
   return output.some(item =>
-    !!item && typeof item === "object" && (item as { type?: unknown }).type === "function_call",
+    !!item && typeof item === "object" && clientToolOutputType((item as { type?: unknown }).type) !== undefined,
   );
 }
 
@@ -20,25 +20,34 @@ export function allowsUnforcedStoreFalseReplay(
   carried: number,
 ): boolean {
   const anchor = providerOutputStart ?? 0;
-  const pendingCallIds = new Set<string>();
+  const pendingCallIds = new Map<string, string>();
   for (const item of stored.slice(anchor)) {
-    if (item && typeof item === "object" && (item as { type?: unknown }).type === "function_call") {
+    if (item && typeof item === "object") {
+      const outputType = clientToolOutputType((item as { type?: unknown }).type);
       const callId = (item as { call_id?: unknown }).call_id;
-      if (typeof callId === "string" && callId) pendingCallIds.add(callId);
+      if (outputType && typeof callId === "string" && callId) pendingCallIds.set(callId, outputType);
     }
   }
   for (let i = 0; i < carried; i++) {
     const item = clientInput[i];
-    if (item && typeof item === "object" && (item as { type?: unknown }).type === "function_call_output") {
+    if (item && typeof item === "object") {
       const callId = (item as { call_id?: unknown }).call_id;
-      if (typeof callId === "string") pendingCallIds.delete(callId);
+      if (typeof callId === "string" && pendingCallIds.get(callId) === (item as { type?: unknown }).type) pendingCallIds.delete(callId);
     }
   }
   return clientInput.slice(carried).some(item => {
-    if (item && typeof item === "object" && (item as { type?: unknown }).type === "function_call_output") {
+    if (item && typeof item === "object") {
       const callId = (item as { call_id?: unknown }).call_id;
-      return typeof callId === "string" && pendingCallIds.has(callId);
+      return typeof callId === "string" && pendingCallIds.has(callId)
+        && pendingCallIds.get(callId) === (item as { type?: unknown }).type;
     }
     return false;
   });
+}
+
+/** Closed call/output pairs supported by the client-owned continuation path. */
+function clientToolOutputType(type: unknown): string | undefined {
+  if (type === "function_call") return "function_call_output";
+  if (type === "custom_tool_call") return "custom_tool_call_output";
+  return undefined;
 }

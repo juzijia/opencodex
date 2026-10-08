@@ -262,6 +262,8 @@ export interface StreamParseState {
   uncapturedToolUse?: boolean;
   /** Consume complete assistant tool_use blocks when the CLI does not stream partial tool events. */
   completeAssistantToolUse?: boolean;
+  /** Complete-only snapshots retained for exact-repeat suppression and conflicting-ID rejection. */
+  completeToolCalls?: Map<string, { name: string; argumentsJson: string; budgetCallIds: string[] }>;
   /** Highest-seen usage snapshot from `message_delta`/assistant frames before a terminal result. */
   partialUsage?: OcxUsage;
 }
@@ -306,15 +308,41 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
             const name = asString(part.name);
             const input = asRecord(part.input);
             if (!id || !name || !input) throw new CodingAgentProtocolError("Coding-agent CLI returned a tool call without structured identity and input.");
+            const argumentsJson = JSON.stringify(input);
+            const previous = state.completeToolCalls?.get(id);
+            if (previous) {
+              if (previous.name !== name || previous.argumentsJson !== argumentsJson) {
+                throw new CodingAgentProtocolError("Coding-agent CLI reused a completed tool call ID with conflicting name or input.");
+              }
+              continue;
+            }
             const limit = Math.min(MAX_TOOL_BLOCK_STARTS, state.maxToolBlockStarts ?? MAX_TOOL_BLOCK_STARTS);
             if ((state.toolBlockStarts ?? 0) >= limit) {
               state.toolCallLimitExceeded = true;
               return events;
             }
+            const budget = state.translatorBudget;
+            const budgetCallIds: string[] = [];
+            if (budget) {
+              try {
+                // Match partial capture: ID has its own call limit; name and args share one.
+                for (const bytes of [Buffer.byteLength(id), Buffer.byteLength(name) + Buffer.byteLength(argumentsJson)]) {
+                  const leaseId = `coding-agent-complete:${++nextBudgetCallOrdinal}`;
+                  budget.openCall(leaseId);
+                  budgetCallIds.push(leaseId);
+                  budget.chargeRetained(bytes, { kind: "tool_args", callId: leaseId });
+                }
+              } catch (error) {
+                for (const leaseId of budgetCallIds) budget.closeCall(leaseId);
+                throw error;
+              }
+            }
+            // Retain snapshot bytes until turn cleanup: dedup still owns name/input after emit.
+            (state.completeToolCalls ??= new Map()).set(id, { name, argumentsJson, budgetCallIds });
             state.toolBlockStarts = (state.toolBlockStarts ?? 0) + 1;
             events.push(
               { type: "tool_call_start", id, name },
-              { type: "tool_call_delta", arguments: JSON.stringify(input) },
+              { type: "tool_call_delta", arguments: argumentsJson },
               { type: "tool_call_end" },
             );
             state.completedToolCalls = (state.completedToolCalls ?? 0) + 1;
@@ -459,6 +487,10 @@ export function releaseOpenToolBlocks(state: StreamParseState): void {
   state.openToolBlocks?.clear();
   for (const leaseId of state.partialToolCallBudgetIds ?? []) state.translatorBudget?.closeCall(leaseId);
   state.partialToolCallBudgetIds = undefined;
+  for (const call of state.completeToolCalls?.values() ?? []) {
+    for (const leaseId of call.budgetCallIds) state.translatorBudget?.closeCall(leaseId);
+  }
+  state.completeToolCalls?.clear();
 }
 
 /** Map a raw Anthropic SSE event (carried inside a `stream_event` frame) to AdapterEvents. */

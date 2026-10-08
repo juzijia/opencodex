@@ -21,7 +21,7 @@ import {
 import { collectReferencedSpillFileNames, snapshotReferencedSpillFileNames } from "./state/spill-inspect";
 import { selectSnapshotEntries, snapshotPayload } from "./state/snapshot-select";
 import { clientCarriedPrefixLength, providerIssuedIdentity } from "./state/replay-fingerprint";
-import { hasPendingFunctionCall, allowsUnforcedStoreFalseReplay } from "./state/unforced-store-false";
+import { hasPendingClientToolCall, allowsUnforcedStoreFalseReplay } from "./state/unforced-store-false";
 import { computeResponseStateMetrics, type ResponseStateMetrics } from "./state/metrics";
 export type { ResponseStateMetrics } from "./state/metrics";
 export type { ResponseStateTempRecoveryResult, ResponseStateTempRecoveryOptions } from "./state/temp-recovery";
@@ -1241,7 +1241,7 @@ export function rememberResponseState(
   if (typeof response.id !== "string" || !Array.isArray(response.output)) return;
   // Only an explicitly opted-in adapter may retain pending client calls despite store:false.
   const unforcedStoreFalse = request.store === false && !opts?.force;
-  if (unforcedStoreFalse && !(opts?.retainForToolContinuation === true && hasPendingFunctionCall(response.output))) return;
+  if (unforcedStoreFalse && !(opts?.retainForToolContinuation === true && hasPendingClientToolCall(response.output))) return;
   if (response.status === "incomplete") {
     const details = response.incomplete_details;
     if (!details || typeof details !== "object" || Array.isArray(details)

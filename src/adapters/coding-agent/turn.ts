@@ -456,13 +456,19 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
             ? message.event as Record<string, unknown>
             : undefined;
           const rawBlock = rawEvent?.content_block;
+          const assistantMessage = toolBridge.completeAssistantToolUse && message.type === "assistant"
+            && message.message !== null && typeof message.message === "object"
+            ? message.message as Record<string, unknown> : undefined;
+          const completeToolUse = Array.isArray(assistantMessage?.content) && assistantMessage.content.some(block =>
+            block !== null && typeof block === "object" && (block as Record<string, unknown>).type === "tool_use",
+          );
           if (
             !initValidated
-            && rawEvent?.type === "content_block_start"
-            && rawBlock !== null
-            && typeof rawBlock === "object"
-            && !Array.isArray(rawBlock)
-            && (rawBlock as Record<string, unknown>).type === "tool_use"
+            && (completeToolUse || (rawEvent?.type === "content_block_start"
+              && rawBlock !== null
+              && typeof rawBlock === "object"
+              && !Array.isArray(rawBlock)
+              && (rawBlock as Record<string, unknown>).type === "tool_use"))
           ) {
             emitOnce({
               type: "error",
@@ -623,7 +629,13 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
         }
         if (toolBridge && !terminalEmitted && sawToolTurnStop && (state.toolBlockStarts ?? 0) > 0
           && (state.completedToolCalls ?? 0) === (state.toolBlockStarts ?? 0)) {
-          // The raw-start gate above already refused any call opened before the handshake.
+          if (!initValidated) {
+            emitOnce({ type: "error", message: "Coding-agent CLI ended before the tool bridge init handshake completed.",
+              status: 502, errorType: "upstream_error", code: "tool_bridge_init_missing", retryable: false });
+            kill();
+            break;
+          }
+          // Both partial and complete tool calls require the validated handshake.
           // The capture-only MCP handler never answers, so the CLI parks after the tool-turn stop.
           // The completed tool_use blocks are this turn's structured output: end the leg here
           // and terminate the tree; the client executes, and the next request continues.

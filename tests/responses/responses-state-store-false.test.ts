@@ -49,13 +49,15 @@ describe("Responses unforced store:false ephemeral function call state", () => {
   });
 
   for (const stream of [false, true]) {
-    for (const [name, toolTurn] of [["qoder", true], ["qoder", false], ["codebuddy", true]] as const) {
+    for (const [name, toolTurn] of [["qoder", true], ["qoder", "custom"], ["qoder", false], ["codebuddy", true], ["codebuddy", "custom"]] as const) {
       test(`execution records only opted-in tool turns (${name}, tools=${toolTurn}, stream=${stream})`, async () => {
         const resolver = { ...await import("../../src/server/adapter-resolve") };
         const release = acquireOwnedSpendHome();
+        const custom = toolTurn === "custom";
+        const toolName = custom ? "exec" : "probe_echo";
         const events: AdapterEvent[] = toolTurn ? [
-          { type: "tool_call_start", id: "qoder_native_execution", name: "probe_echo" },
-          { type: "tool_call_delta", arguments: "{}" }, { type: "tool_call_end" },
+          { type: "tool_call_start", id: "qoder_native_execution", name: toolName },
+          { type: "tool_call_delta", arguments: custom ? '{"input":"echo marker"}' : "{}" }, { type: "tool_call_end" },
           { type: "done", stopReason: "tool_use", endTurn: false },
         ] : [{ type: "text_delta", text: "text-only answer" }, { type: "done" }];
         mock.module("../../src/server/adapter-resolve", () => ({ ...resolver,
@@ -79,7 +81,8 @@ describe("Responses unforced store:false ephemeral function call state", () => {
           const response = await handleResponses(new Request("http://localhost/v1/responses", {
             method: "POST", headers: { "content-type": "application/json", "x-codex-parent-thread-id": "qoder-task" },
             body: JSON.stringify({ model: "fixture/fixture-model", input: "use probe_echo", store: false, stream,
-              tools: [{ type: "function", name: "probe_echo", parameters: { type: "object", properties: {} } }] }),
+              tools: [custom ? { type: "custom", name: "exec", format: { type: "text" } }
+                : { type: "function", name: "probe_echo", parameters: { type: "object", properties: {} } }] }),
           }), config, { provider: "", model: "" });
           expect(response.status).toBe(200);
           const text = await response.text();
@@ -88,14 +91,15 @@ describe("Responses unforced store:false ephemeral function call state", () => {
               .find(event => event.type === "response.completed")?.response
             : JSON.parse(text);
           expect(result?.status).toBe("completed");
+          if (toolTurn) expect(result.output).toContainEqual(expect.objectContaining({ type: custom ? "custom_tool_call" : "function_call" }));
           expect(responseStateMetrics().count).toBe(name === "qoder" && toolTurn ? 1 : 0);
           const next = { model: "fixture-model", previous_response_id: result.id, input: [
-            { type: "function_call_output", call_id: "qoder_native_execution", output: "OK" },
+            { type: custom ? "custom_tool_call_output" : "function_call_output", call_id: "qoder_native_execution", output: "OK" },
           ], store: false };
           const expanded = expandPreviousResponseInput(next, "qoder-task");
           if (name === "qoder" && toolTurn) {
             expect(parseRequest(expanded).context.messages.at(-1)).toMatchObject({
-              role: "toolResult", toolCallId: "qoder_native_execution", toolName: "probe_echo", content: "OK",
+              role: "toolResult", toolCallId: "qoder_native_execution", toolName, content: "OK",
             });
           } else expect(expanded).toEqual(next);
         } finally {
@@ -149,6 +153,64 @@ describe("Responses unforced store:false ephemeral function call state", () => {
         .toMatchObject({ input: [{ role: "user", content: "question" }, ...(response.output as unknown[]), { role: "user", content: "continue" }] });
     });
   }
+
+  test("custom-only store:false continuation is admitted only with opt-in and survives reload", async () => {
+    const call = { type: "custom_tool_call", call_id: "qoder_custom", name: "exec", input: "echo marker" };
+    const response = { id: "resp_custom", status: "completed", output: [call] };
+    rememberResponseState({ input: "run exec", store: false }, response, undefined, { retainForToolContinuation: false });
+    expect(responseStateMetrics().count).toBe(0);
+    rememberResponseState({ input: "run exec", store: false }, response, undefined, qoderStateOptions);
+    expect(responseStateMetrics().count).toBe(1);
+    await flushResponseState();
+    clearResponseStateMemoryForTests();
+    const result = { type: "custom_tool_call_output", call_id: call.call_id, output: "CUSTOM_OK" };
+    const next = { model: "fixture-model", previous_response_id: response.id, input: [result], store: false };
+    const expanded = expandPreviousResponseInput(next, "qoder-task");
+    expect(expanded).toMatchObject({ input: [{ role: "user", content: "run exec" }, call, result] });
+    expect(parseRequest(expanded).context.messages.at(-1)).toMatchObject({
+      role: "toolResult", toolCallId: call.call_id, toolName: "exec", content: "CUSTOM_OK",
+    });
+    for (const input of ["continue", [{ ...result, call_id: "wrong" }], [{ ...result, type: "function_call_output" }]]) {
+      const invalid = { ...next, input };
+      expect(expandPreviousResponseInput(invalid, "qoder-task")).toEqual(invalid);
+    }
+  });
+
+  test.each([false, true])("mixed function/custom batch allows matching results (custom-only=%s)", customOnly => {
+    const calls = [
+      { type: "function_call", call_id: "qoder_function", name: "probe_echo", arguments: "{}" },
+      { type: "custom_tool_call", call_id: "qoder_custom", name: "exec", input: "echo marker" },
+    ];
+    const results = [
+      { type: "function_call_output", call_id: "qoder_function", output: "FUNCTION_OK" },
+      { type: "custom_tool_call_output", call_id: "qoder_custom", output: "CUSTOM_OK" },
+    ];
+    const response = { id: "resp_mixed", status: "completed", output: calls };
+    rememberResponseState({ input: "use both tools", store: false }, response, undefined, qoderStateOptions);
+    // Existing function batches require ANY matching pending result, not all results.
+    // Preserve that contract: a custom-only result admits replay of the whole mixed batch.
+    const input = customOnly ? results.slice(1) : results;
+    const next = { model: "fixture-model", previous_response_id: response.id, input, store: false };
+    const expanded = expandPreviousResponseInput(next, "qoder-task");
+    expect(expanded).toMatchObject({ input: [{ role: "user", content: "use both tools" }, ...calls, ...input] });
+    const parsed = parseRequest(expanded);
+    expect(parsed.context.messages.filter(message => message.role === "toolResult")).toMatchObject(customOnly ? [
+      { toolCallId: "qoder_custom", toolName: "exec", content: "CUSTOM_OK" },
+    ] : [
+      { toolCallId: "qoder_function", toolName: "probe_echo", content: "FUNCTION_OK" },
+      { toolCallId: "qoder_custom", toolName: "exec", content: "CUSTOM_OK" },
+    ]);
+    const wrongPair = { ...next, input: [{ type: "custom_tool_call_output", call_id: "qoder_function", output: "WRONG_KIND" }] };
+    expect(expandPreviousResponseInput(wrongPair, "qoder-task")).toEqual(wrongPair);
+  });
+
+  test("function-only partial result sets continue to admit whole-batch replay", () => {
+    const calls = ["a", "b"].map(call_id => ({ type: "function_call", call_id, name: "probe_echo", arguments: "{}" }));
+    rememberResponseState({ input: "use both", store: false }, { id: "resp_function_partial", output: calls }, undefined, qoderStateOptions);
+    const result = { type: "function_call_output", call_id: "b", output: "OK" };
+    expect(expandPreviousResponseInput({ previous_response_id: "resp_function_partial", input: [result] }, "qoder-task"))
+      .toMatchObject({ input: [{ role: "user", content: "use both" }, ...calls, result] });
+  });
 
   test("Qoder multi-tool continuation preserves both native call IDs and results", () => {
     const calls = [
