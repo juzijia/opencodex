@@ -19,7 +19,7 @@ For capture-only bridges, the init handshake is checked before buffering or emit
 The shared parser admits a valid-ID tool start before allocating its block, with a 16-call
 ceiling for CodeBuddy and Qoder and any tighter bridge ceiling applied there. IDs, names,
 and argument fragments charge the request's translator budget while buffered; closing,
-replacement, and turn cleanup release reservations; Qoder complete snapshots retain budgeted ID/name/input until cleanup, suppress exact repeats, and reject conflicting ID reuse. A new start on an occupied
+replacement, and turn cleanup release reservations; Qoder shares one budgeted emitted-ID/name/input ledger across complete and partial calls until cleanup, suppressing exact repeats and rejecting conflicting reuse in either order. A new start on an occupied
 index closes the previous block only when its arguments form a complete JSON object;
 an unindexed delta or stop cannot be attributed to an indexed block, and a nonempty
 argument delta that cannot be attributed fails immediately. Tool-bridge completion requires every opened block to close, preserving the downstream single-open-call contract.
@@ -30,7 +30,7 @@ The capture-only bridge checks raw starts, complete tool-use frames and synthesi
 buffering; a later init cannot authorize a call that started earlier. The 8 MiB JSONL line
 ceiling is independent of the retained tool-block budget.
 
-Qoder alone opts into restricted `store:false` function/custom-tool continuation through `adapterNeedsToolCallContinuation` in `src/server/responses/core-replay.ts`. RunTurn SSE/JSON and sidecar completion pass `retainForToolContinuation` using the serving adapter; `src/responses/state.ts` admits an unforced `store:false` response only with that opt-in and an actual `function_call` or `custom_tool_call`. Text-only Qoder responses and unforced non-opted-in providers, including CodeBuddy, are not retained. Saved entries keep the existing `unforcedStoreFalse` matching-call/output-type replay gate (any matching pending result admits a partial batch) through TTL, snapshot, spill, reload and memory-budget controls; the admission option is not persisted. Kiro/Cursor forced continuation and passthrough `force:true` remain unchanged.
+Qoder alone opts into restricted `store:false` function/custom-tool continuation through `adapterNeedsToolCallContinuation` in `src/server/responses/core-replay.ts`. RunTurn SSE/JSON and sidecar completion pass `retainForToolContinuation` using the serving adapter; `src/responses/state.ts` admits an unforced `store:false` response only with that opt-in and an actual `function_call` or `custom_tool_call`. Text-only Qoder responses and unforced non-opted-in providers, including CodeBuddy, are not retained. Saved entries keep the existing `unforcedStoreFalse` matching-call/output-type replay gate (any matching pending result admits a partial batch; missing/invalid provider-output boundaries and client-history-only calls never admit replay, including hydrated snapshots/spills) through TTL, snapshot, spill, reload and memory-budget controls; the admission option is not persisted. Kiro/Cursor forced continuation and passthrough `force:true` remain unchanged.
 
 Direct MCP names emitted in a verified custom code-mode catalog follow the
 [Responses restoration boundary](transports/responses-wire-shapes.md#direct-mcp-calls-in-code-mode).

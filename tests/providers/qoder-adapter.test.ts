@@ -49,6 +49,47 @@ function fakeChild(frames: string[], options: { parked?: boolean } = {}): ChildP
 }
 
 describe("qoder adapter", () => {
+  for (const order of ["complete-first", "partial-first"] as const) {
+    for (const reuse of ["duplicate", "name", "input"] as const) {
+      test(`mixed ${order} call-id ${reuse} reuse is checked against one emitted identity`, async () => {
+        const first = { type: "tool_use", id: "call_mixed_identity", name: "mcp__opencodex__probe_echo", input: { value: "A" } };
+        const second = structuredClone(first);
+        if (reuse === "name") second.name = "mcp__opencodex__probe_other";
+        if (reuse === "input") second.input.value = "B";
+        const complete = (call: typeof first, stop = false) => ({ type: "assistant", message: { stop_reason: stop ? "tool_use" : null, content: [call] } });
+        const partial = (call: typeof first) => [
+          { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: call.id, name: call.name } } },
+          // Whitespace differs from the complete serialization; the parsed input is identical.
+          { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: `{ "value": "${call.input.value}" }` } } },
+          { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+        ];
+        const frames = [
+          { type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] },
+          ...(order === "complete-first" ? [complete(first), ...partial(second), complete(second, true)] : [...partial(first), complete(second, true)]),
+        ];
+        const child = fakeChild(frames.map(frame => JSON.stringify(frame) + "\n"), { parked: true });
+        const adapter = createQoderAdapter(provider(), { which: () => "/bin/qoder", spawn: () => child });
+        const events: AdapterEvent[] = [];
+        const budget = createTestTranslatorBudget();
+        await adapter.runTurn!(toolRequest(["probe_echo", "probe_other"]), { headers: new Headers(), translatorBudget: budget }, e => events.push(e));
+        expect(events.filter(e => e.type === "tool_call_start")).toEqual([{ type: "tool_call_start", id: first.id, name: "probe_echo" }]);
+        expect(events.filter(e => e.type === "tool_call_end")).toHaveLength(1);
+        if (reuse === "duplicate") {
+          expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
+          const output = buildResponseJSON(events, "fixture-model").output as Array<Record<string, unknown>>;
+          expect(output.filter(item => item.type === "function_call")).toHaveLength(1);
+          expect(output[0]).toMatchObject({ call_id: first.id, name: "probe_echo" });
+          expect(JSON.parse(String(output[0]?.arguments))).toEqual({ value: "A" });
+        } else {
+          expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error", status: 502 });
+          expect(events.some(e => e.type === "done")).toBe(false);
+        }
+        expect(child.killed).toBe(true);
+        expect(budget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0 });
+      });
+    }
+  }
+
   test.each([false, true])("complete tool calls before init fail closed (late init=%s)", async lateInit => {
     const frames: unknown[] = [{ type: "assistant", message: { stop_reason: "tool_use", content: [
       { type: "tool_use", id: "call_pre_init", name: "mcp__opencodex__probe_echo", input: {} },

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setPlatformForTests } from "../../src/lib/windows-secret-acl";
@@ -22,6 +22,9 @@ import {
   responseStateMetrics,
   setResponseStateByteCapForTests,
 } from "../../src/responses/state";
+
+import { readResponseSpill, writeResponseSpillDurably } from "../../src/responses/spill-store";
+import { allowsUnforcedStoreFalseReplay } from "../../src/responses/state/unforced-store-false";
 
 const qoderStateOptions = {
   clientThreadId: "qoder-task",
@@ -46,6 +49,64 @@ describe("Responses unforced store:false ephemeral function call state", () => {
     removeTreeWithRetry(home);
     if (priorHome === undefined) delete process.env["OPENCODEX_HOME"];
     else process.env["OPENCODEX_HOME"] = priorHome;
+  });
+
+  test("restricted replay rejects missing and invalid boundaries at the gate", () => {
+    const call = { type: "custom_tool_call", call_id: "history_call", name: "exec", input: "echo marker" };
+    const result = { type: "custom_tool_call_output", call_id: call.call_id, output: "OK" };
+    for (const boundary of [undefined, -1, 0.5, NaN, Infinity, 2]) {
+      expect(allowsUnforcedStoreFalseReplay([call], boundary, [result], 0)).toBe(false);
+    }
+    expect(allowsUnforcedStoreFalseReplay([call], 0, [result], 0)).toBe(true);
+  });
+
+  for (const spilled of [false, true]) {
+    for (const boundary of [undefined, -1, 0.5, "1", null, 1000]) {
+      test(`restricted ${spilled ? "spill" : "resident"} snapshot rejects boundary ${String(boundary)}`, async () => {
+        const call = { type: "function_call", call_id: "pending_snapshot", name: "probe_echo", arguments: "{}" };
+        rememberResponseState({ input: "run probe", store: false }, { id: "resp_provenance", output: [call] }, undefined, qoderStateOptions);
+        if (spilled) evictOldestResponseContinuationForBudget();
+        await flushResponseState();
+        const path = join(home, "responses-state.json");
+        const snapshot = JSON.parse(readFileSync(path, "utf8")) as { states: Array<[string, Record<string, unknown>]> };
+        const entry = snapshot.states.find(([id]) => id === "resp_provenance")![1];
+        expect(entry.unforcedStoreFalse).toBe(true);
+        if (boundary === undefined) delete entry.providerOutputStart;
+        else entry.providerOutputStart = boundary;
+        writeFileSync(path, JSON.stringify(snapshot));
+        clearResponseStateMemoryForTests();
+        const next = { previous_response_id: "resp_provenance", input: [{ type: "function_call_output", call_id: call.call_id, output: "OK" }] };
+        expect(expandPreviousResponseInput(next, "qoder-task")).toEqual(next);
+      });
+    }
+
+    test(`a client-history-only call does not authorize restricted replay (${spilled ? "spill" : "resident"})`, async () => {
+      const historyCall = { type: "custom_tool_call", call_id: "client_history", name: "exec", input: "echo marker" };
+      const providerCall = { type: "function_call", call_id: "provider_pending", name: "probe_echo", arguments: "{}" };
+      rememberResponseState({ input: [historyCall], store: false }, { id: "resp_history_boundary", output: [providerCall] }, undefined, qoderStateOptions);
+      if (spilled) evictOldestResponseContinuationForBudget();
+      await flushResponseState();
+      clearResponseStateMemoryForTests();
+      const next = { previous_response_id: "resp_history_boundary", input: [{ type: "custom_tool_call_output", call_id: historyCall.call_id, output: "OK" }] };
+      expect(expandPreviousResponseInput(next, "qoder-task")).toEqual(next);
+      const valid = { ...next, input: [{ type: "function_call_output", call_id: providerCall.call_id, output: "OK" }] };
+      expect(expandPreviousResponseInput(valid, "qoder-task")).not.toEqual(valid);
+    });
+  }
+
+  test("restricted spill payload without a boundary is corrupt even with a valid snapshot stub", () => {
+    const createdAt = Date.now();
+    const call = { type: "function_call", call_id: "spill_history", name: "probe_echo", arguments: "{}" };
+    const spill = writeResponseSpillDurably("resp_unanchored_spill", {
+      createdAt, clientThreadId: "qoder-task", items: [call], unforcedStoreFalse: true,
+    });
+    expect(readResponseSpill("resp_unanchored_spill", spill)).toEqual({ ok: false, reason: "corrupt" });
+    writeFileSync(join(home, "responses-state.json"), JSON.stringify({ version: 2, states: [["resp_unanchored_spill", {
+      kind: "spill", createdAt, clientThreadId: "qoder-task", spill, unforcedStoreFalse: true, providerOutputStart: 0,
+    }]] }));
+    clearResponseStateMemoryForTests();
+    const next = { previous_response_id: "resp_unanchored_spill", input: [{ type: "function_call_output", call_id: call.call_id, output: "OK" }] };
+    expect(expandPreviousResponseInput(next, "qoder-task")).toEqual(next);
   });
 
   for (const stream of [false, true]) {

@@ -52,6 +52,9 @@ export function loadSnapshotEntry(id: string, value: unknown, store: SnapshotLoa
       ? raw as number
       : undefined;
   };
+  // Restricted retention requires proven provider output; legacy unrestricted rows stay readable.
+  if (rec.unforcedStoreFalse === true
+    && anchorFor(rec.kind === "spill" ? Number.MAX_SAFE_INTEGER : Array.isArray(rec.items) ? rec.items.length : 0) === undefined) return;
   if (rec.kind === "spill") {
     if (!isSpillRef(rec.spill)) return;
     const base: Omit<SpilledResponseState, "sizeBytes"> = {

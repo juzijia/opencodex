@@ -262,8 +262,8 @@ export interface StreamParseState {
   uncapturedToolUse?: boolean;
   /** Consume complete assistant tool_use blocks when the CLI does not stream partial tool events. */
   completeAssistantToolUse?: boolean;
-  /** Complete-only snapshots retained for exact-repeat suppression and conflicting-ID rejection. */
-  completeToolCalls?: Map<string, { name: string; argumentsJson: string; budgetCallIds: string[] }>;
+  /** Shared complete/partial snapshots retained for exact-repeat suppression and conflicting-ID rejection. */
+  emittedToolCalls?: Map<string, { name: string; argumentsJson: string; budgetCallIds: string[] }>;
   /** Highest-seen usage snapshot from `message_delta`/assistant frames before a terminal result. */
   partialUsage?: OcxUsage;
 }
@@ -304,18 +304,12 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
           if (thinking) events.push({ type: "thinking_delta", thinking });
         } else if (blockType === "tool_use") {
           const id = asString(part.id);
-          if (state.completeAssistantToolUse && !state.partialToolCallIds?.has(id ?? "")) {
+          if (state.completeAssistantToolUse) {
             const name = asString(part.name);
             const input = asRecord(part.input);
             if (!id || !name || !input) throw new CodingAgentProtocolError("Coding-agent CLI returned a tool call without structured identity and input.");
             const argumentsJson = JSON.stringify(input);
-            const previous = state.completeToolCalls?.get(id);
-            if (previous) {
-              if (previous.name !== name || previous.argumentsJson !== argumentsJson) {
-                throw new CodingAgentProtocolError("Coding-agent CLI reused a completed tool call ID with conflicting name or input.");
-              }
-              continue;
-            }
+            if (isEmittedToolCallRepeat(state, id, name, argumentsJson)) continue;
             const limit = Math.min(MAX_TOOL_BLOCK_STARTS, state.maxToolBlockStarts ?? MAX_TOOL_BLOCK_STARTS);
             if ((state.toolBlockStarts ?? 0) >= limit) {
               state.toolCallLimitExceeded = true;
@@ -338,7 +332,8 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
               }
             }
             // Retain snapshot bytes until turn cleanup: dedup still owns name/input after emit.
-            (state.completeToolCalls ??= new Map()).set(id, { name, argumentsJson, budgetCallIds });
+            (state.emittedToolCalls ??= new Map()).set(id, { name, argumentsJson, budgetCallIds });
+            state.partialToolCallIds?.add(id); // The ledger's lease already owns this ID.
             state.toolBlockStarts = (state.toolBlockStarts ?? 0) + 1;
             events.push(
               { type: "tool_call_start", id, name },
@@ -448,6 +443,16 @@ function resolveToolBlockKey(state: StreamParseState, event: StreamMessage): num
   return state.strictToolBlockCapture && block.indexed ? undefined : key;
 }
 
+/** One emitted identity regardless of whether it arrived complete or in partial blocks. */
+function isEmittedToolCallRepeat(state: StreamParseState, id: string, name: string, argumentsJson: string): boolean {
+  const previous = state.emittedToolCalls?.get(id);
+  if (!previous) return false;
+  if (previous.name !== name || previous.argumentsJson !== argumentsJson) {
+    throw new CodingAgentProtocolError("Coding-agent CLI reused a completed tool call ID with conflicting name or input.");
+  }
+  return true;
+}
+
 /**
  * Emit a closed block atomically — start, the buffered fragments in arrival order, end —
  * so the strictly sequential downstream bridge never sees two calls open at once.
@@ -455,24 +460,41 @@ function resolveToolBlockKey(state: StreamParseState, event: StreamMessage): num
 function closeToolBlock(state: StreamParseState, key: number, events: AdapterEvent[], implicit = false): void {
   const block = state.openToolBlocks?.get(key);
   if (!block || !state.openToolBlocks) return;
-  if (state.strictToolBlockCapture && (implicit || block.argParts.length > 0)) {
+  let argumentsJson: string | undefined;
+  if (state.completeAssistantToolUse || (state.strictToolBlockCapture && (implicit || block.argParts.length > 0))) {
     // A second start on this index is an implicit stop only when the previous call's
     // arguments are already complete. Otherwise a later delta could be assigned to the
     // wrong call and still produce a superficially successful tool-use turn. An explicit
     // stop with no deltas retains the CLI's existing empty-arguments representation.
-    const argumentsJson = block.argParts.join("");
+    const rawArgumentsJson = block.argParts.join("");
     let parsedArguments: unknown;
     try {
-      parsedArguments = JSON.parse(argumentsJson);
+      parsedArguments = JSON.parse(!implicit && block.argParts.length === 0 ? "{}" : rawArgumentsJson);
     } catch {
       throw new CodingAgentProtocolError("Coding-agent CLI ended a tool call with incomplete JSON arguments.");
     }
     if (!asRecord(parsedArguments)) {
       throw new CodingAgentProtocolError("Coding-agent CLI ended a tool call with non-object JSON arguments.");
     }
+    if (state.completeAssistantToolUse) {
+      argumentsJson = JSON.stringify(parsedArguments);
+      if (isEmittedToolCallRepeat(state, block.id, block.name, argumentsJson)) {
+        state.openToolBlocks.delete(key);
+        if (block.budgetCallId) state.translatorBudget?.closeCall(block.budgetCallId);
+        state.toolBlockStarts = (state.toolBlockStarts ?? 1) - 1;
+        return;
+      }
+      // Canonical serialization can expand numeric literals; admit the retained snapshot too.
+      const extraBytes = Buffer.byteLength(argumentsJson) - Buffer.byteLength(rawArgumentsJson);
+      if (extraBytes > 0) state.translatorBudget?.chargeRetained(extraBytes, { kind: "tool_args", callId: block.budgetCallId });
+    }
   }
   state.openToolBlocks.delete(key);
-  if (block.budgetCallId) state.translatorBudget?.closeCall(block.budgetCallId);
+  if (argumentsJson !== undefined) {
+    (state.emittedToolCalls ??= new Map()).set(block.id, {
+      name: block.name, argumentsJson, budgetCallIds: block.budgetCallId ? [block.budgetCallId] : [],
+    });
+  } else if (block.budgetCallId) state.translatorBudget?.closeCall(block.budgetCallId);
   events.push({ type: "tool_call_start", id: block.id, name: block.name });
   for (const part of block.argParts) events.push({ type: "tool_call_delta", arguments: part });
   events.push({ type: "tool_call_end" });
@@ -487,10 +509,10 @@ export function releaseOpenToolBlocks(state: StreamParseState): void {
   state.openToolBlocks?.clear();
   for (const leaseId of state.partialToolCallBudgetIds ?? []) state.translatorBudget?.closeCall(leaseId);
   state.partialToolCallBudgetIds = undefined;
-  for (const call of state.completeToolCalls?.values() ?? []) {
+  for (const call of state.emittedToolCalls?.values() ?? []) {
     for (const leaseId of call.budgetCallIds) state.translatorBudget?.closeCall(leaseId);
   }
-  state.completeToolCalls?.clear();
+  state.emittedToolCalls?.clear();
 }
 
 /** Map a raw Anthropic SSE event (carried inside a `stream_event` frame) to AdapterEvents. */
@@ -550,8 +572,12 @@ function mapRawStreamEvent(event: StreamMessage, state: StreamParseState): Adapt
       const id = asString(block?.id) ?? "";
       const name = asString(block?.name) ?? "tool";
       if (id) {
+        const previous = state.emittedToolCalls?.get(id);
+        if (previous && previous.name !== name) {
+          throw new CodingAgentProtocolError("Coding-agent CLI reused a completed tool call ID with conflicting name or input.");
+        }
         const limit = Math.min(MAX_TOOL_BLOCK_STARTS, state.maxToolBlockStarts ?? MAX_TOOL_BLOCK_STARTS);
-        if ((state.toolBlockStarts ?? 0) >= limit) {
+        if (!previous && (state.toolBlockStarts ?? 0) >= limit) {
           state.toolCallLimitExceeded = true;
           return events;
         }

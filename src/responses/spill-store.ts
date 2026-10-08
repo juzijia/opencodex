@@ -558,6 +558,7 @@ function validPayload(value: unknown, responseId: string): value is ResponseSpil
     && (typeof payload.clientThreadId !== "string" || payload.clientThreadId.trim().length === 0)) return false;
   if (payload.unforcedStoreFalse !== undefined && typeof payload.unforcedStoreFalse !== "boolean") return false;
   if (!Array.isArray(payload.items)) return false;
+  if (payload.unforcedStoreFalse === true && payload.providerOutputStart === undefined) return false;
   // A malformed boundary must degrade to "never skip", never to a bad index: reject the
   // payload outright so materialization treats it as corrupt rather than trusting it.
   if (payload.providerOutputStart !== undefined) {

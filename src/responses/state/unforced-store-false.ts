@@ -19,7 +19,9 @@ export function allowsUnforcedStoreFalseReplay(
   clientInput: readonly unknown[],
   carried: number,
 ): boolean {
-  const anchor = providerOutputStart ?? 0;
+  if (typeof providerOutputStart !== "number" || !Number.isSafeInteger(providerOutputStart)
+    || providerOutputStart < 0 || providerOutputStart > stored.length) return false;
+  const anchor = providerOutputStart;
   const pendingCallIds = new Map<string, string>();
   for (const item of stored.slice(anchor)) {
     if (item && typeof item === "object") {

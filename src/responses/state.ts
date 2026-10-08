@@ -1045,6 +1045,15 @@ function materializeEntry(
     schedulePersist();
     return { ok: false, failure };
   }
+  // A restricted snapshot stub must agree with the validated spill's provenance.
+  if (entry.unforcedStoreFalse && (result.payload.unforcedStoreFalse !== true
+    || entry.providerOutputStart === undefined || entry.providerOutputStart > result.payload.items.length
+    || entry.providerOutputStart !== result.payload.providerOutputStart)) {
+    spillCounters.readFailures += 1;
+    replaceWithSpillFailure(id, entry);
+    schedulePersist();
+    return { ok: false, failure: { code: "previous_response_not_found", reason: "spill_corrupt" } };
+  }
   const state = measureResidentEntry(id, {
     createdAt: result.payload.createdAt,
     ...(result.payload.clientThreadId ? { clientThreadId: result.payload.clientThreadId } : {}),
