@@ -1,5 +1,6 @@
 import { namespacedToolName, type AdapterEvent, type OcxMessage, type OcxParsedRequest, type OcxUsage } from "../../types";
 import type { TranslatorBudget } from "../../lib/translator-budget";
+import { isValidCodingAgentToolNamePart } from "./tool-catalog";
 
 /**
  * Shared stream-json protocol for official coding-agent CLIs (CodeBuddy Code and Qoder CLI).
@@ -242,8 +243,10 @@ export interface StreamParseState {
   openToolBlocks?: Map<number, OpenToolBlock>;
   /** Shared request budget for tool identity and buffered argument fragments. */
   translatorBudget?: TranslatorBudget;
-  /** A capture bridge may impose a tighter ceiling than the shared parser limit. */
+  /** A capture bridge may impose a tighter ceiling on distinct calls and retained blocks. */
   maxToolBlockStarts?: number;
+  /** Qoder's isolated CLI names, validated at partial block start before retaining anything. */
+  toolBridgeNames?: ReadonlyMap<string, string>;
   /** Set before an over-limit block can be allocated or emitted. */
   toolCallLimitExceeded?: boolean;
   /** Synthetic decreasing keys for tool_use start frames that omit the block index. */
@@ -573,6 +576,10 @@ function mapRawStreamEvent(event: StreamMessage, state: StreamParseState): Adapt
       const id = asString(block?.id) ?? "";
       const name = asString(block?.name) ?? "tool";
       if (id) {
+        if (state.completeAssistantToolUse && (!isValidCodingAgentToolNamePart(block?.name)
+          || (state.toolBridgeNames && !state.toolBridgeNames.has(name)))) {
+          throw new CodingAgentProtocolError("Coding-agent CLI started a tool block with an invalid or undeclared name.");
+        }
         const previous = state.emittedToolCalls?.get(id);
         if (previous && previous.name !== name) {
           throw new CodingAgentProtocolError("Coding-agent CLI reused a completed tool call ID with conflicting name or input.");
@@ -591,6 +598,11 @@ function mapRawStreamEvent(event: StreamMessage, state: StreamParseState): Adapt
           // beta, B's complete args, one STOP 2). A new start implicitly closes the previous
           // block only after the capture path verifies its arguments form a complete object.
           closeToolBlock(state, key, events, true);
+        }
+        // Repeats reserve no distinct ID, but each unfinished block retains its own lease.
+        if ((state.openToolBlocks?.size ?? 0) >= limit) {
+          state.toolCallLimitExceeded = true;
+          return events;
         }
         const budget = state.translatorBudget;
         const budgetCallId = budget ? `coding-agent:${++nextBudgetCallOrdinal}` : undefined;

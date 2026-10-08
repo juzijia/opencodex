@@ -49,6 +49,58 @@ function fakeChild(frames: string[], options: { parked?: boolean } = {}): ChildP
 }
 
 describe("qoder adapter", () => {
+  test.each([false, true])("unfinished repeated-ID blocks are bounded before a terminal frame (already emitted=%s)", async alreadyEmitted => {
+    const id = "same_call";
+    const name = "mcp__opencodex__probe_echo";
+    const frames = [
+      { type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] },
+      ...(alreadyEmitted ? [{ type: "assistant", message: { content: [{ type: "tool_use", id, name, input: {} }] } }] : []),
+      ...Array.from({ length: 64 }, (_, index) => ({ type: "stream_event", event: { type: "content_block_start", index,
+        content_block: { type: "tool_use", id, name } } })),
+      // No stops or terminal frames: the seventeenth retained block itself must fail.
+    ];
+    const child = fakeChild(frames.map(frame => JSON.stringify(frame) + "\n"));
+    const adapter = createQoderAdapter(provider(), { which: () => "/bin/qoder", spawn: () => child });
+    const budget = createTestTranslatorBudget();
+    const openCall = budget.openCall.bind(budget);
+    let openedLeases = 0;
+    let peakActive = 0;
+    budget.openCall = leaseId => {
+      openedLeases++;
+      openCall(leaseId);
+      peakActive = Math.max(peakActive, budget.snapshot().activeCalls);
+    };
+    const events: AdapterEvent[] = [];
+    await adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: budget }, e => events.push(e));
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "tool_call_limit", status: 502 });
+    expect(events.some(e => e.type === "done")).toBe(false);
+    expect(events.filter(e => e.type === "tool_call_start")).toHaveLength(alreadyEmitted ? 1 : 0);
+    expect(openedLeases).toBe(alreadyEmitted ? 18 : 17); // 16 blocks plus the shared identity/snapshot leases.
+    expect(peakActive).toBe(openedLeases);
+    expect(budget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0, overflows: 0 });
+    expect(child.killed).toBe(true);
+  });
+
+  test.each([undefined, null, 7, "", " ", "bad,name", "bad\nname", "bad\ud800", "mcp__opencodex__undeclared"])("invalid partial tool name %j is refused before any lease", async name => {
+    const child = fakeChild([
+      JSON.stringify({ type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] }) + "\n",
+      JSON.stringify({ type: "stream_event", event: { type: "content_block_start", index: 0,
+        content_block: { type: "tool_use", id: "same_call", name } } }) + "\n",
+    ]);
+    const adapter = createQoderAdapter(provider(), { which: () => "/bin/qoder", spawn: () => child });
+    // Empty names formerly allocated a block and an ID lease under even an 8-byte budget.
+    const budget = createTestTranslatorBudget({ maxTurnBytes: 8 });
+    const openCall = budget.openCall.bind(budget);
+    let openedLeases = 0;
+    budget.openCall = leaseId => { openedLeases++; openCall(leaseId); };
+    const events: AdapterEvent[] = [];
+    await adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: budget }, e => events.push(e));
+    expect(events).toEqual([expect.objectContaining({ type: "error", code: "protocol_error", status: 502 })]);
+    expect(openedLeases).toBe(0);
+    expect(budget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0, highWaterBytes: 0, overflows: 0 });
+    expect(child.killed).toBe(true);
+  });
+
   for (const repeatClosesFirst of [false, true]) {
     for (const representation of ["complete", "partial"] as const) {
       for (const distinctCalls of [16, 17]) {
@@ -1081,7 +1133,7 @@ describe("qoder authoritative tool-turn completion", () => {
 
     parked.pushFrame({
       type: "stream_event",
-      event: { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "call_inc_2", name: "exec" } },
+      event: { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "call_inc_2", name: "mcp__opencodex__probe_echo" } },
     });
     await new Promise(r => setImmediate(r));
     await new Promise(r => setImmediate(r));

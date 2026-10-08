@@ -407,6 +407,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     strictToolBlockCapture: Boolean(toolBridge),
     partialToolCallIds: toolBridge ? new Set<string>() : undefined,
     completeAssistantToolUse: toolBridge?.completeAssistantToolUse,
+    toolBridgeNames: toolBridge?.completeAssistantToolUse ? toolBridge.emittedNameMap : undefined,
   };
   const toolTurnCompletionSignal = toolBridge?.toolTurnCompletionSignal ?? "message_stop";
   const sawSelectedToolTurnStop = (): boolean => toolTurnCompletionSignal === "assistant_tool_use_stop"

@@ -21,7 +21,7 @@ export class CodingAgentToolCatalogError extends Error {
   }
 }
 
-function validNamePart(value: unknown): value is string {
+export function isValidCodingAgentToolNamePart(value: unknown): value is string {
   if (typeof value !== "string" || !value || INVALID_NAME_PART.test(value)) return false;
   // TextEncoder replaces lone surrogates, which would change tool identity on the MCP wire.
   for (let i = 0; i < value.length; i++) {
@@ -47,7 +47,7 @@ export function buildCodingAgentToolCatalog(parsed: OcxParsedRequest, serverName
   let catalogBytes = 2;
   let allowedToolsArgBytes = 0;
   const tools = selected.map((tool, index) => {
-    if (!tool || !validNamePart(tool.name) || (tool.namespace !== undefined && !validNamePart(tool.namespace))) {
+    if (!tool || !isValidCodingAgentToolNamePart(tool.name) || (tool.namespace !== undefined && !isValidCodingAgentToolNamePart(tool.namespace))) {
       throw new CodingAgentToolCatalogError("invalid tool name or namespace");
     }
     const wireName = namespacedToolName(tool.namespace, tool.name);
