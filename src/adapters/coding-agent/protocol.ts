@@ -254,7 +254,7 @@ export interface StreamParseState {
   completedToolCalls?: number;
   /** CodeBuddy's capture-only bridge requires complete JSON and matching block indices. */
   strictToolBlockCapture?: boolean;
-  /** Tool IDs already captured through partial events, for complete-assistant deduplication. */
+  /** Retained bridge IDs; Qoder counts distinct admissions here, independently of open blocks. */
   partialToolCallIds?: Set<string>;
   /** One budget lease per ID retained by complete-assistant deduplication, released at turn cleanup. */
   partialToolCallBudgetIds?: string[];
@@ -310,8 +310,9 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
             if (!id || !name || !input) throw new CodingAgentProtocolError("Coding-agent CLI returned a tool call without structured identity and input.");
             const argumentsJson = JSON.stringify(input);
             if (isEmittedToolCallRepeat(state, id, name, argumentsJson)) continue;
+            const distinctIds = state.partialToolCallIds ??= new Set<string>();
             const limit = Math.min(MAX_TOOL_BLOCK_STARTS, state.maxToolBlockStarts ?? MAX_TOOL_BLOCK_STARTS);
-            if ((state.toolBlockStarts ?? 0) >= limit) {
+            if (!distinctIds.has(id) && distinctIds.size >= limit) {
               state.toolCallLimitExceeded = true;
               return events;
             }
@@ -333,7 +334,7 @@ export function mapStreamMessageToEvents(message: StreamMessage, state: StreamPa
             }
             // Retain snapshot bytes until turn cleanup: dedup still owns name/input after emit.
             (state.emittedToolCalls ??= new Map()).set(id, { name, argumentsJson, budgetCallIds });
-            state.partialToolCallIds?.add(id); // The ledger's lease already owns this ID.
+            distinctIds.add(id); // The ledger's lease already owns this ID.
             state.toolBlockStarts = (state.toolBlockStarts ?? 0) + 1;
             events.push(
               { type: "tool_call_start", id, name },
@@ -576,8 +577,9 @@ function mapRawStreamEvent(event: StreamMessage, state: StreamParseState): Adapt
         if (previous && previous.name !== name) {
           throw new CodingAgentProtocolError("Coding-agent CLI reused a completed tool call ID with conflicting name or input.");
         }
+        const distinctIds = state.completeAssistantToolUse ? (state.partialToolCallIds ??= new Set<string>()) : undefined;
         const limit = Math.min(MAX_TOOL_BLOCK_STARTS, state.maxToolBlockStarts ?? MAX_TOOL_BLOCK_STARTS);
-        if (!previous && (state.toolBlockStarts ?? 0) >= limit) {
+        if (distinctIds ? !distinctIds.has(id) && distinctIds.size >= limit : (state.toolBlockStarts ?? 0) >= limit) {
           state.toolCallLimitExceeded = true;
           return events;
         }

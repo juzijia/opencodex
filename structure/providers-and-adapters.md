@@ -21,7 +21,7 @@ For capture-only bridges, the init handshake is checked before buffering or emit
 The shared parser admits a valid-ID tool start before allocating its block, with a 16-call
 ceiling for CodeBuddy and Qoder and any tighter bridge ceiling applied there. IDs, names,
 and argument fragments charge the request's translator budget while buffered; closing,
-replacement, and turn cleanup release reservations; Qoder shares one budgeted emitted-ID/name/input ledger across complete and partial calls until cleanup, suppressing exact repeats and rejecting conflicting reuse in either order. A new start on an occupied
+replacement, and turn cleanup release reservations; Qoder shares one budgeted emitted-ID/name/input ledger across complete and partial calls until cleanup, suppressing exact repeats and rejecting conflicting reuse in either order. Its turn limit counts distinct admitted IDs separately from open/closed-block accounting; an open repeat cannot consume a slot for a new identity. A new start on an occupied
 index closes the previous block only when its arguments form a complete JSON object;
 an unindexed delta or stop cannot be attributed to an indexed block, and a nonempty
 argument delta that cannot be attributed fails immediately. Tool-bridge completion requires every opened block to close, preserving the downstream single-open-call contract.

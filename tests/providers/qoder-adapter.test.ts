@@ -49,6 +49,69 @@ function fakeChild(frames: string[], options: { parked?: boolean } = {}): ChildP
 }
 
 describe("qoder adapter", () => {
+  for (const repeatClosesFirst of [false, true]) {
+    for (const representation of ["complete", "partial"] as const) {
+      for (const distinctCalls of [16, 17]) {
+        test(`distinct-call limit ignores a partial repeat (${representation}, repeat-first=${repeatClosesFirst}, calls=${distinctCalls})`, async () => {
+          const call = (index: number) => ({ type: "tool_use", id: `call_limit_${index}`, name: "mcp__opencodex__probe_echo", input: { value: String(index) } });
+          const complete = (index: number) => ({ type: "assistant", message: { content: [call(index)] } });
+          const start = (index: number, blockIndex: number) => ({ type: "stream_event", event: { type: "content_block_start", index: blockIndex, content_block: call(index) } });
+          const delta = (index: number, blockIndex: number) => ({ type: "stream_event", event: { type: "content_block_delta", index: blockIndex, delta: { type: "input_json_delta", partial_json: JSON.stringify(call(index).input) } } });
+          const stop = (index: number) => ({ type: "stream_event", event: { type: "content_block_stop", index } });
+          const distinct = (index: number) => representation === "complete" ? [complete(index)] : [start(index, index), delta(index, index), stop(index)];
+          const frames = [
+            { type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] },
+            ...Array.from({ length: 15 }, (_, index) => complete(index)),
+            start(0, 20), delta(0, 20),
+            ...(repeatClosesFirst ? [stop(20)] : []),
+            ...distinct(15),
+            ...(distinctCalls === 17 ? distinct(16) : []),
+            ...(!repeatClosesFirst ? [stop(20)] : []),
+            { type: "assistant", message: { stop_reason: "tool_use", content: [] } },
+          ];
+          const child = fakeChild(frames.map(frame => JSON.stringify(frame) + "\n"), { parked: true });
+          const adapter = createQoderAdapter(provider(), { which: () => "/bin/qoder", spawn: () => child });
+          const events: AdapterEvent[] = [];
+          const budget = createTestTranslatorBudget();
+          await adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: budget }, e => events.push(e));
+          const starts = events.filter(e => e.type === "tool_call_start");
+          expect(starts.map(e => e.id)).toEqual(Array.from({ length: 16 }, (_, index) => `call_limit_${index}`));
+          expect(events.filter(e => e.type === "tool_call_end")).toHaveLength(16);
+          if (distinctCalls === 16) expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
+          else {
+            expect(events.at(-1)).toMatchObject({ type: "error", code: "tool_call_limit", status: 502 });
+            expect(events.some(e => e.type === "done")).toBe(false);
+          }
+          expect(child.killed).toBe(true);
+          expect(budget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0 });
+        });
+      }
+    }
+  }
+
+  test.each(["incomplete", "conflicting"])("a %s repeat still fails closed after the sixteenth distinct call", async outcome => {
+    const frames: unknown[] = [
+      { type: "system", subtype: "init", mcp_servers: [{ name: "opencodex", status: "connected" }] },
+      ...Array.from({ length: 15 }, (_, index) => ({ type: "assistant", message: { content: [
+        { type: "tool_use", id: `call_limit_${index}`, name: "mcp__opencodex__probe_echo", input: { value: String(index) } },
+      ] } })),
+      { type: "stream_event", event: { type: "content_block_start", index: 20, content_block: { type: "tool_use", id: "call_limit_0", name: "mcp__opencodex__probe_echo" } } },
+      { type: "stream_event", event: { type: "content_block_delta", index: 20, delta: { type: "input_json_delta", partial_json: outcome === "conflicting" ? '{"value":"different"}' : '{"value":' } } },
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "call_limit_15", name: "mcp__opencodex__probe_echo", input: { value: "15" } }] } },
+      ...(outcome === "conflicting" ? [{ type: "stream_event", event: { type: "content_block_stop", index: 20 } }] : []),
+      { type: "assistant", message: { stop_reason: "tool_use", content: [] } },
+    ];
+    const child = fakeChild(frames.map(frame => JSON.stringify(frame) + "\n"), { parked: true });
+    const adapter = createQoderAdapter(provider(), { which: () => "/bin/qoder", spawn: () => child });
+    const events: AdapterEvent[] = [];
+    const budget = createTestTranslatorBudget();
+    await adapter.runTurn!(toolRequest(), { headers: new Headers(), translatorBudget: budget }, e => events.push(e));
+    expect(events.filter(e => e.type === "tool_call_start")).toHaveLength(16);
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "protocol_error", status: 502 });
+    expect(events.some(e => e.type === "done")).toBe(false);
+    expect(budget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0 });
+  });
+
   for (const order of ["complete-first", "partial-first"] as const) {
     for (const reuse of ["duplicate", "name", "input"] as const) {
       test(`mixed ${order} call-id ${reuse} reuse is checked against one emitted identity`, async () => {
