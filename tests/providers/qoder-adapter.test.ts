@@ -563,11 +563,13 @@ describe("qoder adapter", () => {
     expect(events[0]).toMatchObject({ type: "error", code: "non_canonical_destination" });
   });
 
-  test("Global image-capable seeds bypass the vision sidecar", () => {
+  test("Global discovery fallback does not classify models as vision sidecar consumers", () => {
     const global = getProviderRegistryEntry("qoder")!;
-    expect(global.modelInputModalities?.["Qwen3.8-Max"]).toEqual(["text", "image"]);
-    expect(global.modelInputModalities?.["unknown-live-id"]).toBeUndefined();
-    expect(isModelVisionSidecarConsumer(global as OcxProviderConfig, "Qwen3.8-Max")).toBe(false);
+    expect(global.models).toContain("Qwen3.8-Max");
+    expect(global.noVisionModels).toBeUndefined();
+    expect(global.modelInputModalities).toBeUndefined();
+    expect(isModelVisionSidecarConsumer(global, "Qwen3.8-Max")).toBe(false);
+    expect(isModelVisionSidecarConsumer(global, "unknown-live-id")).toBe(false);
   });
 
   test("keeps residual Qoder CN image input rejected before spawn", async () => {
@@ -591,7 +593,7 @@ describe("qoder adapter", () => {
     });
   });
 
-  test("forwards Qoder image input through the shared coding-agent projection", async () => {
+  test("forwards Qoder Global raw image input through the shared coding-agent projection", async () => {
     let spawned = 0;
     let stdin = "";
     const child = fakeChild(['{"type":"result","subtype":"success","is_error":false}\n']);
@@ -608,7 +610,7 @@ describe("qoder adapter", () => {
         return child;
       },
     });
-    const request = parsed({ context: { messages: [{ role: "user", content: [{ type: "image", imageUrl: "data:image/png;base64,AA==" }], timestamp: 0 }] } });
+    const request = parsed({ modelId: "unknown-live-id", context: { messages: [{ role: "user", content: [{ type: "image", imageUrl: "data:image/png;base64,AA==" }], timestamp: 0 }] } });
     const events: AdapterEvent[] = [];
     await adapter.runTurn!(request, { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, event => events.push(event));
     expect(spawned).toBe(1);
