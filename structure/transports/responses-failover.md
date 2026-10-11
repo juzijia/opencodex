@@ -198,16 +198,7 @@ relay identity markers are restored on the wrapped response so Windows/Bun strea
 logging retain their existing owners. A failed child keeps its physical attempt receipt and usage,
 while the successful child remains the logical request result.
 
-A `runTurn` adapter has the equivalent boundary in `preflightAdapterEvents`
-(`src/adapters/run-turn-queue.ts`), streaming and non-streaming alike: when its first meaningful
-event is a tool call the current request did not declare, and no earlier replay-unsafe heartbeat
-recorded a side effect, `src/server/responses/run-turn-execution.ts` projects the fail-closed
-undeclared-tool refusal as a pre-commit 502 so the combo can hop with the unchanged catalog. After
-any output or a replay-unsafe heartbeat the refusal stays with that child. Chat Completions and
-Anthropic Messages inbound requests do not use this classification.
-The same heartbeat also decides an ordinary pre-output adapter error or an empty end: after a
-replay-unsafe heartbeat the child's 502 is marked non-replayable, so the combo stops on it instead
-of sending the turn to the next target.
+A `runTurn` adapter has the equivalent boundary in `preflightAdapterEvents` (`src/adapters/run-turn-queue.ts`), streaming and non-streaming alike: when its first meaningful event is a tool call the current request did not declare, and no earlier replay-unsafe heartbeat recorded a side effect, `src/server/responses/run-turn-execution.ts` projects the fail-closed undeclared-tool refusal as a pre-commit 502 so the combo can hop with the unchanged catalog. After any output or a replay-unsafe heartbeat the refusal stays with that child. Chat Completions and Anthropic Messages inbound requests do not use this classification. The same heartbeat also decides an ordinary pre-output adapter error or an empty end: after a replay-unsafe heartbeat the child's 502 is marked non-replayable, so the combo stops on it instead of sending the turn to the next target.
 
 HTTP 410 remains terminal by default. It advances and cools only the exact combo target when the
 structured code or message explicitly identifies a model lifecycle event (end-of-life, retired,
@@ -598,3 +589,7 @@ provider cannot establish the original serving identity and remains portable.
 
 The `anthropic` OAuth and `anthropic-apikey` registry entries use native `anthropic-speed` FastWire only for `claude-opus-5-5`, `claude-opus-5` and `claude-opus-4-8`; there is no provider-wide Fast fallback. In the main adapter dispatch loop, a fast refusal naming fast mode or the `speed` parameter (400 or 429), or a 429 with a fast-pool remaining header of zero, may use one shared-budget repair permit for a standard-speed resend.
 The resend charges the root workflow send counter once without a second request-budget charge. The request retains the drop decision through later rebuilds and records `anthropic-fast-downgrade`, cause `parameter-rejected`, and a `downgraded` / `response-declined` tier outcome. A spent budget leaves the original refusal intact; generic 429 and 529 responses keep their ordinary handling. This repair precedes same-target 429 waiting and credential rotation. Continuation and sidecar owners do not use this repair. Coverage: `tests/routing/fastwire-policy.test.ts` and `tests/responses/responses-anthropic-fast-downgrade.test.ts`.
+
+## runTurn API-key recovery
+
+`src/server/responses/run-turn-execution.ts` activates the new key-pool preflight only for the Qoder adapter and recovers a pre-output 401/429 only when its private classifier supplies internal `apiKeyRecovery: true` and a multi-key pool exists. It reuses the preflight output/replay-unsafe boundary and credential-hop/physical-send budget; the streaming preflight wait is bounded by the request stall budget, so a silent CLI cannot hold the SSE Response, and pre-output recovery still applies in-stream after the bound. The attempt captures its existing adapter binding at the send observation; recovery passes that binding's key and `_apiKeyAttempt` to the existing API-key 401/429 helpers. A late failure cannot cool or overwrite a newer manual selection. The replacement rebuilds the adapter and replay scope before dispatch. Failed credentials are not resent in the request; the initial pool size and shared budget bound attempts. Local refusals, cancellation, committed output, missing permission and single-key installs do not rotate or record key cooldowns. CodeBuddy and Claude CLI do not enter the new key-pool preflight or gain recovery permission; their existing streaming, cancellation and timeout paths are unchanged. Undated quota failures retain the existing default cooldown; no daily reset is inferred.

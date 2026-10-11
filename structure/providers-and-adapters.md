@@ -245,7 +245,7 @@ within the inclusive output total as `reasoningOutputTokens`, including final cu
 Missing or invalid optional detail stays unreported internally; totals and cache accounting do not change.
 The Chat/Responses projections expose that subset as `reasoning_tokens`; no text-based estimate is made.
 `src/adapters/run-turn-queue.ts` preflight callers may supply an optional wait bound; timeout hands
-the outstanding iterator read to replay once, while callers without a bound keep the existing wait.
+the outstanding iterator read to replay once, while callers without a bound keep the existing wait. The optional failure classifier on `src/adapters/coding-agent/turn.ts` receives failed Result frames or the bounded, redacted process-exit diagnostic. Qoder supplies its vendor semantics from `src/adapters/qoder/adapter.ts`, including PAT rejection and account quota exhaustion. Recognized numeric codes precede text fallback; model, team and ambiguous quota scopes grant no key recovery. Exit classification cannot replace an earlier terminal or protocol failure. The internal error event's `apiKeyRecovery: true` permits consideration, not execution, of key recovery and is never serialized. Only Qoder's private classifier grants recovery permission. Without a classifier, CodeBuddy and Claude CLI retain their original normalized events without permission; neither `tokenEnv` nor the unchanged shared parser's status or legacy quota classification grants it.
 
 Fast response evidence follows the [response-tier observation contract](transports/responses.md#response-tier-observation-authority):
 an explicit provider declaration can mark an intermediary's echo non-authoritative without

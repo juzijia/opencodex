@@ -566,18 +566,18 @@ describe("sidecar on429 wiring", () => {
     //                rotateAntigravityAccountOnAuthRefusal instead. The new default
     //                only moves OAuth traffic; key-auth defaults and Anthropic's own
     //                wire/pool remain unchanged.
-    //   anthropic = 3: the same, MINUS runTurn -- that path is Cursor-only (cursor.ts is the
-    //                  sole adapter implementing runTurn), so Anthropic cannot reach it.
-    //   key       = 3: hasKeyPoolFailover guards the two 429 response loops plus the
-    //                  pre-stream 401 recovery site (a rejected key rotates instead of
-    //                  failing the request); the sidecar reaches the key pool through
+    //   anthropic = 3: its existing HTTP recovery sites; the self-authenticated Claude
+    //                  CLI does not authorize API-key recovery through runTurn.
+    //   key       = 6: the three existing HTTP guards plus runTurn preflight activation,
+    //                  its explicitly permitted API-key recovery arm, and the streaming
+    //                  preflight stall bound. The sidecar reaches the key pool through
     //                  rotateProviderTransportOn429 instead.
     //
     // Adding a recovery site means deciding, deliberately, which rotators it needs and
     // updating the matching number. That decision is the thing this test exists to force.
     expect(counts.generic).toBe(5);
     expect(counts.anthropic).toBe(3);
-    expect(counts.key).toBe(3);
+    expect(counts.key).toBe(6);
   });
 
   test("the verify-account arm moves via auth-refusal rotation, never rate-limit", () => {
