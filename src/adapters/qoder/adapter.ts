@@ -34,10 +34,16 @@ function classifyQoderFailure(failure: CodingAgentFailure): Extract<AdapterEvent
       ...(code === 110 || code === 118 ? { apiKeyRecovery: true as const } : {}),
     };
   }
-  if (/daily usage limit|credit usage limit/i.test(error.message)) return {
-    ...error, status: 429, errorType: "insufficient_quota", code: "insufficient_quota",
-    retryable: false, apiKeyRecovery: true,
-  };
+  if (typeof code === "number") return error;
+  if (/daily usage limit|credit usage limit/i.test(error.message)) {
+    const isAccountDaily = /^You've reached your daily usage limit for Chat\b/i.test(error.message.trim())
+      && !/\b(?:team|model|shared)\b/i.test(error.message);
+    return {
+      ...error, status: 429, errorType: "insufficient_quota", code: "insufficient_quota",
+      retryable: false,
+      ...(isAccountDaily ? { apiKeyRecovery: true as const } : {}),
+    };
+  }
   if (/\binvalid (?:personal access )?token\b|\btoken (?:was |that was )?rejected\b|\bqoder authentication rejected\b/i.test(error.message)) return auth();
   return error;
 }

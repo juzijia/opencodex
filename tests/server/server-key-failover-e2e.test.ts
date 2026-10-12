@@ -1666,11 +1666,19 @@ describe("runTurn API-key recovery", () => {
     }
   });
 
-  test("model quota 119 overrides daily wording without cooling a key", async () => {
-    const result = await cliKeyRecoveryCase({ vendorCode: 119, result: "daily usage limit" });
+  test.each([
+    ["Team daily usage limit reached", { result: "Team daily usage limit reached" }],
+    ["This model's credit usage limit reached", { result: "This model's credit usage limit reached" }],
+    ["Shared daily usage limit reached", { result: "Shared daily usage limit reached" }],
+    ["999 + supported account daily text", { vendorCode: 999, result: "You've reached your daily usage limit for Chat. Come back tomorrow..." }],
+    ["999 + authentication text", { vendorCode: 999, result: "invalid personal access token" }],
+  ])("nonrecoverable qoder failure (%s) prevents key failover", async (_name, fixture) => {
+    const result = await cliKeyRecoveryCase(fixture);
     expect(result.seen).toEqual(["synthetic-cli-a"]);
-    expect(result.aCooldown).toBeNull(); expect(result.bCooldown).toBeNull();
-    expect(result.errors[0]!.apiKeyRecovery).toBeUndefined();
+    expect(result.active).toBe("synthetic-cli-a");
+    expect(result.aCooldown).toBeNull();
+    expect(result.bCooldown).toBeNull();
+    expect(result.budgetUsed).toBe(1);
   });
 
   test.each([

@@ -1317,15 +1317,18 @@ describe("qoder authoritative tool-turn completion", () => {
 
 describe("Qoder API-key recovery evidence", () => {
   test.each([
-    [105, 401, "authentication_error", "invalid_api_key", true],
-    [110, 429, "insufficient_quota", "insufficient_quota", true],
-    [113, 429, "insufficient_quota", "insufficient_quota", false],
-    [114, 403, "permission_error", "permission_denied", false],
-    ...[115, 116, 117, 119, 122].map(code => [code, 429, "insufficient_quota", "insufficient_quota", false]),
-    [118, 429, "insufficient_quota", "insufficient_quota", true],
-  ])("result %s keeps numeric scope over daily wording", async (vendorCode, status, errorType, code, allowed) => {
+    [105, 401, "authentication_error", "invalid_api_key", true, undefined],
+    [110, 429, "insufficient_quota", "insufficient_quota", true, undefined],
+    [113, 429, "insufficient_quota", "insufficient_quota", false, undefined],
+    [114, 403, "permission_error", "permission_denied", false, undefined],
+    ...[115, 116, 117, 119, 122].map(code => [code, 429, "insufficient_quota", "insufficient_quota", false, undefined] as const),
+    [118, 429, "insufficient_quota", "insufficient_quota", true, undefined],
+    [999, 502, "upstream_error", "upstream_error", false, undefined],
+    [999, 401, "authentication_error", "invalid_api_key", false, "invalid personal access token"],
+  ] as const)("result %s keeps numeric scope", async (vendorCode, status, errorType, code, allowed, resultText) => {
+    const result = resultText ?? "You've reached your daily usage limit for Chat. Come back tomorrow...";
     const child = fakeChild([JSON.stringify({ type: "result", is_error: true, error_code: vendorCode,
-      result: "You've reached your daily usage limit for Chat. Come back tomorrow..." }) + "\n"]);
+      result }) + "\n"]);
     const events: AdapterEvent[] = [];
     await createQoderAdapter(provider(), { which: () => "/bin/qoder", spawn: () => child })
       .runTurn!(parsed(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
@@ -1335,19 +1338,32 @@ describe("Qoder API-key recovery evidence", () => {
   });
 
   test.each([
-    ["You've reached your daily usage limit for Chat. Come back tomorrow...", 429, true],
-    ["credit usage limit", 429, true],
-    ["invalid personal access token", 401, true],
-    ["token rejected", 401, true],
-    ["Qoder authentication rejected", 401, true],
-    ["Too many requests: rate limit reached", 429, false],
-    ["authentication service error", 502, false],
-  ] as const)("message %s", async (result, status, allowed) => {
+    ["You've reached your daily usage limit for Chat. Come back tomorrow...", 429, "insufficient_quota", "insufficient_quota", true],
+    ["You've reached your daily usage limit for Chat.", 429, "insufficient_quota", "insufficient_quota", true],
+    ["You've reached your daily usage limit for Chat", 429, "insufficient_quota", "insufficient_quota", true],
+    ["You've reached your daily usage limit for Chat. Come back tomorrow at 00:00 UTC.", 429, "insufficient_quota", "insufficient_quota", true],
+    ["daily usage limit", 429, "insufficient_quota", "insufficient_quota", false],
+    ["credit usage limit", 429, "insufficient_quota", "insufficient_quota", false],
+    ["Team daily usage limit reached", 429, "insufficient_quota", "insufficient_quota", false],
+    ["Team credit usage limit reached", 429, "insufficient_quota", "insufficient_quota", false],
+    ["Model daily usage limit reached", 429, "insufficient_quota", "insufficient_quota", false],
+    ["This model's credit usage limit reached", 429, "insufficient_quota", "insufficient_quota", false],
+    ["Shared daily usage limit reached", 429, "insufficient_quota", "insufficient_quota", false],
+    ["Shared credit usage limit reached", 429, "insufficient_quota", "insufficient_quota", false],
+    ["You've reached your daily usage limit for Chat for this team", 429, "insufficient_quota", "insufficient_quota", false],
+    ["You've reached your daily usage limit for Chat for this model", 429, "insufficient_quota", "insufficient_quota", false],
+    ["You've reached your daily usage limit for Chat (shared)", 429, "insufficient_quota", "insufficient_quota", false],
+    ["invalid personal access token", 401, "authentication_error", "invalid_api_key", true],
+    ["token rejected", 401, "authentication_error", "invalid_api_key", true],
+    ["Qoder authentication rejected", 401, "authentication_error", "invalid_api_key", true],
+    ["Too many requests: rate limit reached", 429, "rate_limit_error", "rate_limit_exceeded", false],
+    ["authentication service error", 502, "upstream_error", "upstream_error", false],
+  ] as const)("message %s", async (result, status, errorType, code, allowed) => {
     const events: AdapterEvent[] = [];
     await createQoderAdapter(provider(), { which: () => "/bin/qoder",
       spawn: () => fakeChild([JSON.stringify({ type: "result", is_error: true, result }) + "\n"]) })
       .runTurn!(parsed(), { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, e => events.push(e));
-    expect(events.at(-1)).toMatchObject({ type: "error", status });
+    expect(events.at(-1)).toMatchObject({ type: "error", status, errorType, code });
     expect((events.at(-1) as Extract<AdapterEvent, { type: "error" }>).apiKeyRecovery).toBe(allowed ? true : undefined);
     expect(JSON.stringify(buildResponseJSON(events, "Qwen3.8-Max"))).not.toContain("apiKeyRecovery");
   });
