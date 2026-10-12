@@ -39,7 +39,6 @@ function classifyQoderFailure(failure: CodingAgentFailure): Extract<AdapterEvent
     retryable: false, apiKeyRecovery: true,
   };
   if (/\binvalid (?:personal access )?token\b|\btoken (?:was |that was )?rejected\b|\bqoder authentication rejected\b/i.test(error.message)) return auth();
-  if (error.status === 429 && error.errorType === "rate_limit_error") return { ...error, apiKeyRecovery: true };
   return error;
 }
 

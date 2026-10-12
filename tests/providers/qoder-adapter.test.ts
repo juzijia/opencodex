@@ -1340,7 +1340,7 @@ describe("Qoder API-key recovery evidence", () => {
     ["invalid personal access token", 401, true],
     ["token rejected", 401, true],
     ["Qoder authentication rejected", 401, true],
-    ["Too many requests: rate limit reached", 429, true],
+    ["Too many requests: rate limit reached", 429, false],
     ["authentication service error", 502, false],
   ] as const)("message %s", async (result, status, allowed) => {
     const events: AdapterEvent[] = [];
