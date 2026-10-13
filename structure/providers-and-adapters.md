@@ -4,7 +4,7 @@ Configured spend ceilings bind adapter inference executors to the [seed and phys
 Devin combines only [consecutive same-ID tool results](adapters/registry.md#devin-consecutive-tool-results), using linear accumulation while preserving intervening message slots, image parts and error markers without mutating the parsed request.
 Anthropic account pause, model routes, quota labels, and the separate `anthropic2` pool (its helpers, quota, reset grants and management surfaces) follow the [Anthropic account-pool contract](providers/anthropic-account-pool.md). Devin Messages follows the [per-turn output ordering contract](clients/claude-desktop.md#devin-messages-output-ordering), preserving late signatures before text/tools without changing Responses or Chat ordering.
 
-Managed native Anthropic serving UUID and observed CLI header continuity follow [native Messages](data-planes/protocol-paths.md#managed-native-messages); generated Responses retain the adapter's compatibility fingerprint.
+API-key credit-balance refusals follow the [Anthropic billing recovery contract](providers/anthropic-key-billing.md). Managed native Anthropic serving UUID and observed CLI header continuity follow [native Messages](data-planes/protocol-paths.md#managed-native-messages); generated Responses retain the adapter's compatibility fingerprint.
 
 Per-account usage thresholds follow the [Anthropic account thresholds contract](providers/anthropic-account-thresholds.md).
 A shared-quota Anthropic 429 or classified pre-output account 403 records the served account's cooldown even when the request has used its allowed retry sends. That final account remains excluded on the next request; combo target cooling for 429 is skipped only after the matching account cooldown is present. Exact revoked-token 401s persist generation-fenced reauthentication under [the Anthropic recovery contract](providers/anthropic-account-pool.md#revoked-oauth-access-token-recovery).
@@ -364,10 +364,10 @@ Provider-scoped capability hints remain authoritative when discovery returns an 
 capabilities. In particular, `src/providers/registry/entries-core.ts` assigns OpenCode Go's live
 `deepseek-v4.1-flash` route the official 1,048,576-token window instead of the conservative 128k
 routed-model fallback. Custom-named Azure OpenAI providers obtain missing image/text input metadata and context/output limits through the destination-gated lookup in `src/providers/derive.ts`, consumed by shared catalog hints. Discovery refreshes public models.dev Azure rows through `src/providers/azure-model-metadata.ts`; stale cache and bundled hints remain available offline. This uses known model ids without changing transport selection or persisting model declarations; see [the shared catalog contract](catalog.md#shared-catalog).
-Meta's two direct surfaces keep separate reasoning contracts: `meta-model` remains capped at
-`xhigh`, while `meta-muse` advertises `max` and sends the transparent Muse compatibility
-User-Agent required by that credential surface. The existing registry header merge keeps an
-operator-supplied User-Agent authoritative.
+Meta's two direct surfaces keep separate reasoning contracts: `meta-model` caps Muse Spark at `xhigh`
+and gives Muse Wonder (`muse-wonder-1.0`) its documented `minimal`..`max` ladder, while `meta-muse`
+advertises `max` and sends the transparent Muse compatibility User-Agent required by that
+credential surface. The existing registry header merge keeps an operator-supplied User-Agent authoritative.
 The same registry declares the first-party `deepseek-flash` model with `text` and `image` input,
 so it bypasses the vision sidecar by default; explicit `noVisionModels` or text-only declarations
 remain authoritative. First-party `deepseek-chat`, `deepseek-reasoner`, and `deepseek-v4-flash`

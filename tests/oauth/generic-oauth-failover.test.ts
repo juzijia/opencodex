@@ -568,16 +568,22 @@ describe("sidecar on429 wiring", () => {
     //                wire/pool remain unchanged.
     //   anthropic = 3: its existing HTTP recovery sites; the self-authenticated Claude
     //                  CLI does not authorize API-key recovery through runTurn.
-    //   key       = 6: the three existing HTTP guards plus runTurn preflight activation,
+    //   key       = 7: hasKeyPoolFailover guards the three existing HTTP sites (two 429
+    //                  response loops and the pre-stream 401 recovery site), the pre-output
+    //                  Anthropic credit-balance loop (#6958), plus runTurn preflight activation,
     //                  its explicitly permitted API-key recovery arm, and the streaming
-    //                  preflight stall bound. The sidecar reaches the key pool through
+    //                  preflight stall bound. The billing loop needs only the key rotator: an
+    //                  OAuth credit refusal already rotates through the Anthropic account
+    //                  arm, and generic OAuth has no credit-balance contract. Send-accounting
+    //                  eligibility goes through isAnthropicBillingKeyPool, which is not a
+    //                  recovery site. The sidecar reaches the key pool through
     //                  rotateProviderTransportOn429 instead.
     //
     // Adding a recovery site means deciding, deliberately, which rotators it needs and
     // updating the matching number. That decision is the thing this test exists to force.
     expect(counts.generic).toBe(5);
     expect(counts.anthropic).toBe(3);
-    expect(counts.key).toBe(6);
+    expect(counts.key).toBe(7);
   });
 
   test("the verify-account arm moves via auth-refusal rotation, never rate-limit", () => {
