@@ -1593,6 +1593,8 @@ export const vi: Record<TKey, string> = {
   "quota.cursorFirstParty": "Các model first-party",
   "quota.cursorApiUsage": "Mức sử dụng API",
   "quota.totalSubscriptionCredits": "Tổng credit gói đăng ký",
+  "quota.userQuota": "Credits gói",
+  "quota.addOnQuota": "Gói bổ sung",
   "quota.creditsBalance": "Số dư credit",
   "quota.creditsPeriodEnds": "Chu kỳ thanh toán kết thúc vào {date}",
   "quota.usedPercent": "Đã dùng {pct}%",

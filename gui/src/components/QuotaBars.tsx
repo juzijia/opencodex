@@ -13,8 +13,10 @@ export type QuotaBarRow = {
   customLabel?: string;
   label: string;
   limitLabel: string;
-  percent: number;
+  percent?: number;
   resetAt?: number;
+  used?: number;
+  limit?: number;
 };
 
 /**
@@ -23,6 +25,24 @@ export type QuotaBarRow = {
  * shorter windows first — 5h, weekly, cursor first-party, cursor API, monthly,
  * then subscription credits before other custom windows.
  */
+
+function rawCreditBucketRank(kind: string): number {
+  if (kind === "userQuota") return 4.6;
+  if (kind === "addOnQuota") return 4.7;
+  return 4.8;
+}
+
+export function resolveCreditBucketLabel(bucket: { kind: string; label?: string }, t: TFn): string {
+  if (bucket.label) return bucket.label;
+  switch (bucket.kind) {
+    case "userQuota":
+      return t("quota.userQuota");
+    case "addOnQuota":
+      return t("quota.addOnQuota");
+    default:
+      return bucket.kind;
+  }
+}
 function rawCustomWindowRank(rawLabel: string): number {
   if (rawLabel === "5h") return 0;
   if (rawLabel === "First-party models") return 2;
@@ -138,6 +158,21 @@ export function buildQuotaRows(quota: AccountQuota | null, plan: string | null |
       });
     }
   }
+  for (const bucket of displayQuota.creditBuckets ?? []) {
+    const rawLabel = bucket.label || (bucket.kind === "userQuota" ? "Plan Credits" : bucket.kind === "addOnQuota" ? "Add-on Pack" : bucket.kind);
+    const localized = resolveCreditBucketLabel(bucket, t);
+    ranked.push({
+      rank: rawCreditBucketRank(bucket.kind),
+      row: {
+        customLabel: rawLabel,
+        label: localized,
+        limitLabel: localized,
+        percent: bucket.percent,
+        used: bucket.used,
+        limit: bucket.limit,
+      },
+    });
+  }
   return ranked.sort((a, b) => a.rank - b.rank).map(entry => entry.row);
 }
 
@@ -154,6 +189,9 @@ export function maxQuotaUtilisation(quota: AccountQuota | null): number {
   );
   if (!hasSubscriptionCreditsCustom && typeof quota.creditsUsd?.percent === "number") {
     vals.push(quota.creditsUsd.percent);
+  }
+  for (const b of quota.creditBuckets ?? []) {
+    if (typeof b.percent === "number") vals.push(b.percent);
   }
   return vals.length ? Math.max(...vals) : -1;
 }
@@ -190,20 +228,21 @@ function bcp47(locale: Locale): string {
 }
 
 /** Display-only exhaustion cutoff (adopted with rationale: rounding shows 100%). */
-export function isQuotaExhausted(percent: number): boolean {
-  return percent >= 99.5;
+export function isQuotaExhausted(percent?: number): boolean {
+  return typeof percent === "number" && percent >= 99.5;
 }
 
-export function isQuotaWarn(percent: number, threshold: number): boolean {
-  return threshold > 0 && percent >= threshold;
+export function isQuotaWarn(percent?: number, threshold: number = 80): boolean {
+  return typeof percent === "number" && threshold > 0 && percent >= threshold;
 }
 
-export function quotaBarTone(percent: number, threshold: number): "bar-green" | "bar-warn" {
+export function quotaBarTone(percent?: number, threshold: number = 80): "bar-green" | "bar-warn" {
   return isQuotaWarn(percent, threshold) || isQuotaExhausted(percent) ? "bar-warn" : "bar-green";
 }
 
 /** Tiny usage still shows a visible bar (min ~4%) so 0–2% isn't invisible; 0 stays 0. */
-export function barWidth(percent: number): number {
+export function barWidth(percent?: number): number {
+  if (typeof percent !== "number") return 0;
   const clamped = Math.max(0, Math.min(100, percent));
   if (clamped <= 0) return 0;
   return Math.max(4, Math.round(clamped));
@@ -355,6 +394,8 @@ export default function QuotaBars({
             threshold={threshold}
             t={t}
             locale={locale}
+            used={row.used}
+            limit={row.limit}
           />
           {row.windowKey === "weekly" && afterWeekly}
         </Fragment>
@@ -364,15 +405,18 @@ export default function QuotaBars({
   );
 }
 
-function QuotaRow({ credits, label, percent, resetAt, threshold, t, locale }: {
+function QuotaRow({ credits, label, percent, resetAt, threshold, t, locale, used, limit }: {
   credits?: boolean;
   label: string;
-  percent: number;
+  percent?: number;
   resetAt?: number;
   threshold: number;
   t: TFn;
   locale: Locale;
+  used?: number;
+  limit?: number;
 }) {
+  const hasPercent = typeof percent === "number";
   const exhausted = isQuotaExhausted(percent);
   const warn = isQuotaWarn(percent, threshold);
   const color = quotaBarTone(percent, threshold);
@@ -381,21 +425,30 @@ function QuotaRow({ credits, label, percent, resetAt, threshold, t, locale }: {
     ? `${t("codexAuth.resets")} ${reset.day} ${reset.time}`.replace(/\s+/g, " ").trim()
     : undefined;
   const hasReset = reset.day !== "" || reset.time !== "";
+  const tag = bcp47(locale);
   return (
     <div className={`quota-row${credits ? " quota-row--credits" : ""}${warn ? " quota-row--warn" : ""}${exhausted ? " quota-row--exhausted" : ""}`}>
       <span className="quota-label" title={resetTitle}>{label}</span>
       <span className="quota-reset-label">{hasReset ? t("codexAuth.resets") : ""}</span>
       <span className="quota-reset-day">{reset.day}</span>
       <span className="quota-reset-time">{reset.time}</span>
-      <div className="bar" title={resetTitle}><div className={`bar-fill ${color}`} style={barFillStyle(percent)} /></div>
+      <div className="bar" title={resetTitle}>
+        {hasPercent && <div className={`bar-fill ${color}`} style={barFillStyle(percent!)} />}
+      </div>
       <span
         className={`quota-val${warn ? " quota-val--warn" : ""}`}
         title={exhausted ? t("quota.limitReached") : resetTitle}
         aria-label={resetTitle}
       >
         {warn && <IconAlert width={12} height={12} aria-hidden="true" />}
-        {Math.round(percent)}%
-        {exhausted ? ` · ${t("quota.limitReached")}` : ""}
+        {hasPercent ? (
+          <>
+            {Math.round(percent!)}%
+            {exhausted ? ` · ${t("quota.limitReached")}` : ""}
+          </>
+        ) : (
+          used !== undefined && limit !== undefined ? `${new Intl.NumberFormat(tag).format(used)} / ${new Intl.NumberFormat(tag).format(limit)}` : ""
+        )}
       </span>
     </div>
   );
@@ -408,10 +461,12 @@ function StackedQuotaRow({ row, threshold, t, locale, incomplete }: {
   locale: Locale;
   incomplete: boolean;
 }) {
+  const hasPercent = typeof row.percent === "number";
   const exhausted = isQuotaExhausted(row.percent);
   const warn = isQuotaWarn(row.percent, threshold);
   const color = quotaBarTone(row.percent, threshold);
   const resetText = formatResetFuture(row.resetAt, t, locale);
+  const tag = bcp47(locale);
   return (
     <div className={`quota-stacked-row${warn ? " quota-stacked-row--warn" : ""}${exhausted ? " quota-stacked-row--exhausted" : ""}`}>
       <div className="quota-stacked-head">
@@ -431,12 +486,22 @@ function StackedQuotaRow({ row, threshold, t, locale, incomplete }: {
         <span className="quota-stacked-reset muted">{resetText}</span>
       </div>
       <div className="quota-stacked-bar-row">
-        <div className="bar quota-stacked-bar">
-          <div className={`bar-fill ${color}`} style={barFillStyle(row.percent)} />
-        </div>
-        <span className={`quota-stacked-used${warn ? " quota-stacked-used--warn" : ""}`}>
-          {t("quota.usedPercent", { pct: Math.round(row.percent) })}
-        </span>
+        {hasPercent ? (
+          <>
+            <div className="bar quota-stacked-bar">
+              <div className={`bar-fill ${color}`} style={barFillStyle(row.percent!)} />
+            </div>
+            <span className={`quota-stacked-used${warn ? " quota-stacked-used--warn" : ""}`}>
+              {t("quota.usedPercent", { pct: Math.round(row.percent!) })}
+            </span>
+          </>
+        ) : (
+          row.used !== undefined && row.limit !== undefined ? (
+            <span className="quota-stacked-used">
+              {`${new Intl.NumberFormat(tag).format(row.used)} / ${new Intl.NumberFormat(tag).format(row.limit)}`}
+            </span>
+          ) : null
+        )}
       </div>
       {exhausted && (
         <div className="quota-stacked-limit-reached" role="status">
