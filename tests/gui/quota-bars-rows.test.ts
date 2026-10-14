@@ -96,6 +96,43 @@ describe("buildQuotaRows (WP070)", () => {
     expect(maxQuotaUtilisation(reported)).toBe(0);
   });
 
+  test("creditBuckets convert to ranked rows and resolve localized labels", () => {
+    const reported = quota({
+      creditBuckets: [
+        { kind: "userQuota", used: 100, limit: 1000, remaining: 900, percent: 10 },
+        { kind: "addOnQuota", used: 300, limit: 1000, remaining: 700, percent: 30 },
+      ],
+    });
+    const rows = buildQuotaRows(reported, null, t);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.label).toBe("quota.userQuota");
+    expect(rows[0]?.percent).toBe(10);
+    expect(rows[0]?.used).toBe(100);
+    expect(rows[0]?.limit).toBe(1000);
+    expect(rows[1]?.label).toBe("quota.addOnQuota");
+    expect(rows[1]?.percent).toBe(30);
+    expect(maxQuotaUtilisation(reported)).toBe(30);
+  });
+
+  test("creditBuckets support percent absent and 0/0 boundary conditions", () => {
+    const reported = quota({
+      creditBuckets: [
+        { kind: "userQuota", used: 0, limit: 0, remaining: 0, percent: 0 },
+        { kind: "addOnQuota", used: 250, limit: 1000, remaining: 750 },
+      ],
+    });
+    const rows = buildQuotaRows(reported, null, t);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.percent).toBe(0);
+    expect(rows[0]?.used).toBe(0);
+    expect(rows[0]?.limit).toBe(0);
+
+    expect(rows[1]?.percent).toBeUndefined();
+    expect(rows[1]?.used).toBe(250);
+    expect(rows[1]?.limit).toBe(1000);
+    expect(maxQuotaUtilisation(reported)).toBe(0);
+  });
+
   test("subscription credits rank after monthly and before other custom windows", () => {
     const rows = buildQuotaRows(quota({
       fiveHourPercent: 10,

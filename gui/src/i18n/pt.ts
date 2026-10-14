@@ -1613,6 +1613,8 @@ export const pt: Record<TKey, string> = {
   "quota.cursorFirstParty": "Modelos próprios",
   "quota.cursorApiUsage": "Uso da API",
   "quota.totalSubscriptionCredits": "Total de créditos da assinatura",
+  "quota.userQuota": "Créditos do plano",
+  "quota.addOnQuota": "Pacote adicional",
   "quota.creditsBalance": "Saldo de créditos",
   "quota.creditsPeriodEnds": "O período de cobrança termina em {date}",
   "quota.usedPercent": "{pct}% usado",

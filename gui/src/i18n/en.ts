@@ -1629,6 +1629,8 @@ export const en = {
   "quota.cursorFirstParty": "First-party models",
   "quota.cursorApiUsage": "API usage",
   "quota.totalSubscriptionCredits": "Total subscription credits",
+  "quota.userQuota": "Plan Credits",
+  "quota.addOnQuota": "Add-on Pack",
   "quota.creditsBalance": "Credits balance",
   "quota.creditsPeriodEnds": "Billing period ends {date}",
   "quota.usedPercent": "{pct}% used",

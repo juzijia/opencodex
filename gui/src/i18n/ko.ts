@@ -2784,6 +2784,8 @@ export const ko: Record<TKey, string> = {
   "quota.cursorFirstParty": "자사 모델",
   "quota.cursorApiUsage": "API 사용량",
   "quota.totalSubscriptionCredits": "전체 구독 크레딧",
+  "quota.userQuota": "플랜 크레딧",
+  "quota.addOnQuota": "추가 팩",
   "quota.creditsBalance": "크레딧 잔액",
   "quota.creditsPeriodEnds": "청구 기간 종료: {date}",
   "quota.usedPercent": "{pct}% 사용",
