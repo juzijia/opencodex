@@ -1412,10 +1412,16 @@ export async function fetchQoderQuota(provider: string, config: OcxProviderConfi
   const parseBucket = (kind: string, raw: unknown): ProviderCreditBucket | null => {
     const rec = asRecord(raw);
     if (!rec) return null;
-    const used = toFiniteNumber(rec.used);
-    const total = toFiniteNumber(rec.total ?? rec.limit);
-    if (used === undefined && total === undefined) return null;
+    let used = toFiniteNumber(rec.used);
+    let total = toFiniteNumber(rec.total ?? rec.limit);
     const remaining = toFiniteNumber(rec.remaining);
+    if (used === undefined && total !== undefined && remaining !== undefined && total >= remaining) {
+      used = total - remaining;
+    }
+    if (total === undefined && used !== undefined && remaining !== undefined) {
+      total = used + remaining;
+    }
+    if (used === undefined || total === undefined) return null;
     let percent: number | undefined;
     if (rec.percentage !== undefined) {
       if (typeof rec.percentage === "string") {
@@ -1427,8 +1433,8 @@ export async function fetchQoderQuota(provider: string, config: OcxProviderConfi
     }
     return {
       kind,
-      used: used ?? 0,
-      limit: total ?? (used !== undefined && remaining !== undefined ? used + remaining : 0),
+      used,
+      limit: total,
       ...(remaining !== undefined ? { remaining } : {}),
       ...(percent !== undefined ? { percent } : {}),
     };
