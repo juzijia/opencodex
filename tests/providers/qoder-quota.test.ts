@@ -196,6 +196,108 @@ describe("Qoder provider quota probe", () => {
     expect(addOn.percent).toBeUndefined();
   });
 
+  test("handles missing fields, derivations, and unreliable data without forging 0", async () => {
+    // 1. used missing: derives total - remaining
+    // 2. total missing: derives used + remaining
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/jobToken/exchange")) {
+        return new Response(JSON.stringify({ token: "t1" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        data: {
+          userQuota: {
+            total: 1000,
+            remaining: 750,
+          },
+          addOnQuota: {
+            used: 300,
+            remaining: 700,
+          },
+        },
+      }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const result = await fetchQoderQuota("qoder", qoderConfig().providers.qoder!);
+    expect(result).not.toBeNull();
+    const report = result as { quota: { creditBuckets: Array<{ kind: string; used: number; limit: number; remaining?: number }> } };
+    expect(report.quota.creditBuckets).toHaveLength(2);
+
+    const user = report.quota.creditBuckets.find(b => b.kind === "userQuota")!;
+    expect(user.used).toBe(250); // derived: 1000 - 750
+    expect(user.limit).toBe(1000);
+    expect(user.remaining).toBe(750);
+
+    const addOn = report.quota.creditBuckets.find(b => b.kind === "addOnQuota")!;
+    expect(addOn.used).toBe(300);
+    expect(addOn.limit).toBe(1000); // derived: 300 + 700
+    expect(addOn.remaining).toBe(700);
+
+    // 3. Unreliable missing fields: cannot forge 0 (including remaining > total anomaly)
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/jobToken/exchange")) {
+        return new Response(JSON.stringify({ token: "t1" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        data: {
+          userQuota: {
+            used: 500, // no total, no remaining: cannot reliably determine total or forge 0
+          },
+          addOnQuota: {
+            total: 1000, // no used, no remaining: cannot reliably determine used or forge 0
+          },
+        },
+      }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    expect(await fetchQoderQuota("qoder", qoderConfig().providers.qoder!)).toBeNull();
+
+    // 3b. remaining > total with missing used must not forge 0 (Math.max(0, neg) defect avoided)
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/jobToken/exchange")) {
+        return new Response(JSON.stringify({ token: "t1" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        data: {
+          userQuota: {
+            total: 500,
+            remaining: 600, // remaining > total, cannot reliably determine used -> must not forge 0
+          },
+        },
+      }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    expect(await fetchQoderQuota("qoder", qoderConfig().providers.qoder!)).toBeNull();
+
+    // 4. One bucket valid, one bucket invalid: keeps only the valid bucket
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/jobToken/exchange")) {
+        return new Response(JSON.stringify({ token: "t1" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        data: {
+          userQuota: {
+            total: 500,
+            remaining: 500, // used missing, derived as 500 - 500 = 0 (legitimate zero)
+          },
+          addOnQuota: {
+            remaining: 200, // cannot determine used or total -> dropped
+          },
+        },
+      }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const partialResult = await fetchQoderQuota("qoder", qoderConfig().providers.qoder!);
+    expect(partialResult).not.toBeNull();
+    const partialReport = partialResult as { quota: { creditBuckets: Array<{ kind: string; used: number; limit: number; remaining?: number }> } };
+    expect(partialReport.quota.creditBuckets).toEqual([
+      { kind: "userQuota", used: 0, limit: 500, remaining: 500 },
+    ]);
+  });
+
   test("returns TERMINAL_QUOTA_FAILURE on 401 and null on transient errors", async () => {
     // 401 on exchange -> terminal
     globalThis.fetch = (async () => new Response("Unauthorized", { status: 401 })) as unknown as typeof fetch;
