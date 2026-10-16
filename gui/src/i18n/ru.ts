@@ -1586,6 +1586,7 @@ export const ru: Record<TKey, string> = {
   "quota.creditsBalance": "Остаток кредитов",
   "quota.creditsPeriodEnds": "Расчётный период заканчивается {date}",
   "quota.usedPercent": "Использовано {pct}%",
+  "quota.noQuota": "Нет квоты",
   "quota.limitReached": "Лимит исчерпан",
   "quota.resetsToday": "Сброс сегодня в {time}",
   "quota.resetsTomorrow": "Сброс завтра в {time}",

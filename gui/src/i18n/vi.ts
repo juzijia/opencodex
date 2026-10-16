@@ -1598,6 +1598,7 @@ export const vi: Record<TKey, string> = {
   "quota.creditsBalance": "Số dư credit",
   "quota.creditsPeriodEnds": "Chu kỳ thanh toán kết thúc vào {date}",
   "quota.usedPercent": "Đã dùng {pct}%",
+  "quota.noQuota": "Không có hạn mức",
   "quota.limitReached": "Đã đạt giới hạn",
   "quota.resetsToday": "Đặt lại hôm nay lúc {time}",
   "quota.resetsTomorrow": "Đặt lại ngày mai lúc {time}",

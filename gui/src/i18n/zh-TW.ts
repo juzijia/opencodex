@@ -1298,6 +1298,7 @@ export const zhTW: Record<TKey, string> = {
   "quota.creditsBalance": "額度餘額",
   "quota.creditsPeriodEnds": "帳單週期結束於 {date}",
   "quota.usedPercent": "已用 {pct}%",
+  "quota.noQuota": "無配額",
   "quota.limitReached": "已達上限",
   "quota.resetsToday": "今天 {time} 重設",
   "quota.resetsTomorrow": "明天 {time} 重設",
