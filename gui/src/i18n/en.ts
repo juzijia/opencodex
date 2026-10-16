@@ -1634,6 +1634,7 @@ export const en = {
   "quota.creditsBalance": "Credits balance",
   "quota.creditsPeriodEnds": "Billing period ends {date}",
   "quota.usedPercent": "{pct}% used",
+  "quota.noQuota": "No quota",
   "quota.limitReached": "Limit reached",
   "quota.resetsToday": "Resets today at {time}",
   "quota.resetsTomorrow": "Resets tomorrow at {time}",

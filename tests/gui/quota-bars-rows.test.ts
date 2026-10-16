@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  barFillStyle,
   barWidth,
   buildQuotaRows,
+  creditBarWidth,
   formatResetFuture,
   isCustomQuotaWindowIncomplete,
   isQuotaExhausted,
@@ -127,6 +129,8 @@ describe("buildQuotaRows (WP070)", () => {
     expect(rows[0]?.used).toBe(0);
     expect(rows[0]?.limit).toBe(0);
 
+    expect(rows[0]?.isCreditBucket).toBe(true);
+    expect(rows[1]?.isCreditBucket).toBe(true);
     expect(rows[1]?.percent).toBeUndefined();
     expect(rows[1]?.used).toBe(250);
     expect(rows[1]?.limit).toBe(1000);
@@ -283,6 +287,24 @@ describe("barWidth", () => {
     expect(barWidth(3.4)).toBe(4);
     expect(barWidth(50)).toBe(50);
     expect(barWidth(120)).toBe(100);
+  });
+});
+
+describe("creditBarWidth and barFillStyle", () => {
+  test("creditBarWidth scales faithfully without 4% visibility floor", () => {
+    expect(creditBarWidth(0)).toBe(0);
+    expect(creditBarWidth(-5)).toBe(0);
+    expect(creditBarWidth(0.2)).toBe(0.2);
+    expect(creditBarWidth(1)).toBe(1);
+    expect(creditBarWidth(50)).toBe(50);
+    expect(creditBarWidth(120)).toBe(100);
+  });
+
+  test("barFillStyle differentiates regular quota vs credit buckets", () => {
+    expect(barFillStyle(0.2, true)).toEqual({ "--bar-scale": "0.002" });
+    expect(barFillStyle(0.2, false)).toEqual({ "--bar-scale": "0.04" });
+    expect(barFillStyle(0, true)).toEqual({ "--bar-scale": "0" });
+    expect(barFillStyle(50, true)).toEqual({ "--bar-scale": "0.5" });
   });
 });
 

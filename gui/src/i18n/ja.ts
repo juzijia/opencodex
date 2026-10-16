@@ -1517,6 +1517,7 @@ export const ja: Record<TKey, string> = {
   "quota.creditsBalance": "クレジット残高",
   "quota.creditsPeriodEnds": "請求期間終了日: {date}",
   "quota.usedPercent": "{pct}% 使用",
+  "quota.noQuota": "クォータなし",
   "quota.limitReached": "上限に達しました",
   "quota.resetsToday": "今日 {time} にリセット",
   "quota.resetsTomorrow": "明日 {time} にリセット",

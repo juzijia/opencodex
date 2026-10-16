@@ -17,6 +17,7 @@ export type QuotaBarRow = {
   resetAt?: number;
   used?: number;
   limit?: number;
+  isCreditBucket?: boolean;
 };
 
 /**
@@ -170,6 +171,7 @@ export function buildQuotaRows(quota: AccountQuota | null, plan: string | null |
         percent: bucket.percent,
         used: bucket.used,
         limit: bucket.limit,
+        isCreditBucket: true,
       },
     });
   }
@@ -248,8 +250,20 @@ export function barWidth(percent?: number): number {
   return Math.max(4, Math.round(clamped));
 }
 
-function barFillStyle(percent: number): CSSProperties {
-  return { ["--bar-scale" as string]: String(barWidth(percent) / 100) };
+/**
+ * Faithful proportion for credit buckets without forcing the 4% visibility floor.
+ * Clamped between 0 and 100; positive values below 1 keep their exact ratio.
+ */
+export function creditBarWidth(percent?: number): number {
+  if (typeof percent !== "number") return 0;
+  const clamped = Math.max(0, Math.min(100, percent));
+  if (clamped <= 0) return 0;
+  return clamped;
+}
+
+export function barFillStyle(percent: number, isCreditBucket?: boolean): CSSProperties {
+  const width = isCreditBucket ? creditBarWidth(percent) : barWidth(percent);
+  return { ["--bar-scale" as string]: String(width / 100) };
 }
 
 /**
@@ -387,7 +401,7 @@ export default function QuotaBars({
       {rows.map(row => (
         <Fragment key={row.label}>
           <QuotaRow
-            credits={row.customLabel === SUBSCRIPTION_CREDITS_LABEL}
+            credits={row.customLabel === SUBSCRIPTION_CREDITS_LABEL || Boolean(row.isCreditBucket)}
             label={row.label}
             percent={row.percent}
             resetAt={row.resetAt}
@@ -396,6 +410,7 @@ export default function QuotaBars({
             locale={locale}
             used={row.used}
             limit={row.limit}
+            isCreditBucket={row.isCreditBucket}
           />
           {row.windowKey === "weekly" && afterWeekly}
         </Fragment>
@@ -405,7 +420,18 @@ export default function QuotaBars({
   );
 }
 
-function QuotaRow({ credits, label, percent, resetAt, threshold, t, locale, used, limit }: {
+function QuotaRow({
+  credits,
+  label,
+  percent,
+  resetAt,
+  threshold,
+  t,
+  locale,
+  used,
+  limit,
+  isCreditBucket,
+}: {
   credits?: boolean;
   label: string;
   percent?: number;
@@ -415,10 +441,12 @@ function QuotaRow({ credits, label, percent, resetAt, threshold, t, locale, used
   locale: Locale;
   used?: number;
   limit?: number;
+  isCreditBucket?: boolean;
 }) {
-  const hasPercent = typeof percent === "number";
-  const exhausted = isQuotaExhausted(percent);
-  const warn = isQuotaWarn(percent, threshold);
+  const isNoQuota = Boolean(isCreditBucket && used === 0 && limit === 0);
+  const hasPercent = typeof percent === "number" && !isNoQuota;
+  const exhausted = !isNoQuota && isQuotaExhausted(percent);
+  const warn = !isNoQuota && isQuotaWarn(percent, threshold);
   const color = quotaBarTone(percent, threshold);
   const reset = formatResetAt(resetAt, t, locale);
   const resetTitle = reset.day || reset.time
@@ -426,6 +454,7 @@ function QuotaRow({ credits, label, percent, resetAt, threshold, t, locale, used
     : undefined;
   const hasReset = reset.day !== "" || reset.time !== "";
   const tag = bcp47(locale);
+  const isTinyPercent = Boolean(isCreditBucket && typeof percent === "number" && percent > 0 && percent < 1);
   return (
     <div className={`quota-row${credits ? " quota-row--credits" : ""}${warn ? " quota-row--warn" : ""}${exhausted ? " quota-row--exhausted" : ""}`}>
       <span className="quota-label" title={resetTitle}>{label}</span>
@@ -433,7 +462,7 @@ function QuotaRow({ credits, label, percent, resetAt, threshold, t, locale, used
       <span className="quota-reset-day">{reset.day}</span>
       <span className="quota-reset-time">{reset.time}</span>
       <div className="bar" title={resetTitle}>
-        {hasPercent && <div className={`bar-fill ${color}`} style={barFillStyle(percent!)} />}
+        {hasPercent && <div className={`bar-fill ${color}`} style={barFillStyle(percent!, isCreditBucket)} />}
       </div>
       <span
         className={`quota-val${warn ? " quota-val--warn" : ""}`}
@@ -441,9 +470,11 @@ function QuotaRow({ credits, label, percent, resetAt, threshold, t, locale, used
         aria-label={resetTitle}
       >
         {warn && <IconAlert width={12} height={12} aria-hidden="true" />}
-        {hasPercent ? (
+        {isNoQuota ? (
+          t("quota.noQuota")
+        ) : hasPercent ? (
           <>
-            {Math.round(percent!)}%
+            {isTinyPercent ? "<1%" : `${Math.round(percent!)}%`}
             {exhausted ? ` · ${t("quota.limitReached")}` : ""}
           </>
         ) : (
@@ -461,12 +492,14 @@ function StackedQuotaRow({ row, threshold, t, locale, incomplete }: {
   locale: Locale;
   incomplete: boolean;
 }) {
-  const hasPercent = typeof row.percent === "number";
-  const exhausted = isQuotaExhausted(row.percent);
-  const warn = isQuotaWarn(row.percent, threshold);
+  const isNoQuota = Boolean(row.isCreditBucket && row.used === 0 && row.limit === 0);
+  const hasPercent = typeof row.percent === "number" && !isNoQuota;
+  const exhausted = !isNoQuota && isQuotaExhausted(row.percent);
+  const warn = !isNoQuota && isQuotaWarn(row.percent, threshold);
   const color = quotaBarTone(row.percent, threshold);
   const resetText = formatResetFuture(row.resetAt, t, locale);
   const tag = bcp47(locale);
+  const isTinyPercent = Boolean(row.isCreditBucket && typeof row.percent === "number" && row.percent > 0 && row.percent < 1);
   return (
     <div className={`quota-stacked-row${warn ? " quota-stacked-row--warn" : ""}${exhausted ? " quota-stacked-row--exhausted" : ""}`}>
       <div className="quota-stacked-head">
@@ -486,13 +519,17 @@ function StackedQuotaRow({ row, threshold, t, locale, incomplete }: {
         <span className="quota-stacked-reset muted">{resetText}</span>
       </div>
       <div className="quota-stacked-bar-row">
-        {hasPercent ? (
+        {isNoQuota ? (
+          <span className="quota-stacked-used muted">
+            {t("quota.noQuota")}
+          </span>
+        ) : hasPercent ? (
           <>
             <div className="bar quota-stacked-bar">
-              <div className={`bar-fill ${color}`} style={barFillStyle(row.percent!)} />
+              <div className={`bar-fill ${color}`} style={barFillStyle(row.percent!, row.isCreditBucket)} />
             </div>
             <span className={`quota-stacked-used${warn ? " quota-stacked-used--warn" : ""}`}>
-              {t("quota.usedPercent", { pct: Math.round(row.percent!) })}
+              {t("quota.usedPercent", { pct: isTinyPercent ? "<1" : Math.round(row.percent!) })}
             </span>
           </>
         ) : (

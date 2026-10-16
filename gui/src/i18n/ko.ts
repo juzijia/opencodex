@@ -2789,6 +2789,7 @@ export const ko: Record<TKey, string> = {
   "quota.creditsBalance": "크레딧 잔액",
   "quota.creditsPeriodEnds": "청구 기간 종료: {date}",
   "quota.usedPercent": "{pct}% 사용",
+  "quota.noQuota": "할당량 없음",
   "quota.limitReached": "한도 도달",
   "quota.resetsToday": "오늘 {time} 초기화",
   "quota.resetsTomorrow": "내일 {time} 초기화",
