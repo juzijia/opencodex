@@ -1422,15 +1422,11 @@ export async function fetchQoderQuota(provider: string, config: OcxProviderConfi
       total = used + remaining;
     }
     if (used === undefined || total === undefined) return null;
-    let percent: number | undefined;
-    if (rec.percentage !== undefined) {
-      if (typeof rec.percentage === "string") {
-        const cleaned = rec.percentage.replace(/%$/, "").trim();
-        percent = normalizePercent(cleaned);
-      } else {
-        percent = normalizePercent(rec.percentage);
-      }
-    }
+    // Qoder can return a fractional "percentage" value (e.g. 0.24 for 24%).
+    // The used/total pair is unambiguous and keeps the bar and totals consistent.
+    const percent = total > 0
+      ? normalizePercent(Math.round((used / total) * 10_000) / 100)
+      : used === 0 && total === 0 ? 0 : undefined;
     return {
       kind,
       used,

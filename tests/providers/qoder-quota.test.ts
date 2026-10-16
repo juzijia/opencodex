@@ -107,7 +107,7 @@ describe("Qoder provider quota probe", () => {
             total: 1800,
             used: 323,
             remaining: 1477,
-            percentage: 17.94,
+            percentage: 0.24, // fractional and inconsistent; used / total is authoritative
             unit: "credits",
             isQuotaExceeded: false,
           },
@@ -193,7 +193,7 @@ describe("Qoder provider quota probe", () => {
     expect(addOn.used).toBe(100);
     expect(addOn.limit).toBe(500);
     expect(addOn.remaining).toBe(400);
-    expect(addOn.percent).toBeUndefined();
+    expect(addOn.percent).toBe(20);
   });
 
   test("handles missing fields, derivations, and unreliable data without forging 0", async () => {
@@ -294,7 +294,7 @@ describe("Qoder provider quota probe", () => {
     expect(partialResult).not.toBeNull();
     const partialReport = partialResult as { quota: { creditBuckets: Array<{ kind: string; used: number; limit: number; remaining?: number }> } };
     expect(partialReport.quota.creditBuckets).toEqual([
-      { kind: "userQuota", used: 0, limit: 500, remaining: 500 },
+      { kind: "userQuota", used: 0, limit: 500, remaining: 500, percent: 0 },
     ]);
   });
 
