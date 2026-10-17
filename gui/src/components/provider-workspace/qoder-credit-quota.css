@@ -25,3 +25,14 @@
   grid-row: 1;
   white-space: nowrap;
 }
+
+/* Compact bars have 16px inline padding; align the usage/balance line to it. */
+.qoder-credit-quota .pws-capacity-recovery {
+  display: flex;
+  padding-inline: 16px;
+}
+
+.qoder-credit-quota .pws-capacity-recovery strong {
+  margin-left: auto;
+  white-space: nowrap;
+}
