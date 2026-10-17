@@ -101,19 +101,6 @@ describe("QuotaBars credit bucket and quota rendering", () => {
     expect(compactZh).toContain("--bar-scale:0.002");
   });
 
-  test("regular quotas below 1% also show 0%, retaining their existing minimum bar width", () => {
-    const q = quota({ fiveHourPercent: 0.8 });
-    const t = ((k, v) => interpolate(en[k], v)) as TFn;
-    const stacked = renderWithLocale(<QuotaBars quota={q} threshold={80} t={t} layout="stacked" />);
-    const compact = renderWithLocale(<QuotaBars quota={q} threshold={80} t={t} layout="compact" />);
-    expect(stacked).toContain("0% used");
-    expect(compact).toContain("0%");
-    expect(stacked).toContain("--bar-scale:0.04");
-    expect(compact).toContain("--bar-scale:0.04");
-    expect(stacked).not.toContain("&lt;1%");
-    expect(compact).not.toContain("&lt;1%");
-  });
-
   test("normal non-zero percent (50%) renders standard percentage and scale", () => {
     const q = quota({
       creditBuckets: [
@@ -151,21 +138,21 @@ describe("QuotaBars credit bucket and quota rendering", () => {
     expect(compactZh).not.toContain("%");
   });
 
-  test("regular rate-limit row (1%) retains existing 4% min-width floor and normal text", () => {
+  test("regular rate-limit row (0.8%) shows rounded 0% while retaining the 4% min-width floor", () => {
     const q = quota({
-      fiveHourPercent: 1,
+      fiveHourPercent: 0.8,
     });
 
     const stackedZh = renderWithLocale(<QuotaBars quota={q} threshold={80} t={((k, v) => interpolate(zh[k], v)) as TFn} layout="stacked" />, "zh");
-    expect(stackedZh).toContain("已用 1%");
+    expect(stackedZh).toContain("已用 0%");
     expect(stackedZh).toContain("--bar-scale:0.04"); // 4% floor preserved for regular quota!
 
     const stackedEn = renderWithLocale(<QuotaBars quota={q} threshold={80} t={((k, v) => interpolate(en[k], v)) as TFn} layout="stacked" />, "en");
-    expect(stackedEn).toContain("1% used");
+    expect(stackedEn).toContain("0% used");
     expect(stackedEn).toContain("--bar-scale:0.04");
 
     const compactZh = renderWithLocale(<QuotaBars quota={q} threshold={80} t={((k, v) => interpolate(zh[k], v)) as TFn} layout="compact" />, "zh");
-    expect(compactZh).toContain("1%");
+    expect(compactZh).toContain("0%");
     expect(compactZh).toContain("--bar-scale:0.04");
   });
 });

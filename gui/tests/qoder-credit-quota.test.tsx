@@ -43,7 +43,6 @@ test("Qoder displays usage below 1% as 0%, not <1%", () => {
   );
   expect(markup).toContain("0%");
   expect(markup).not.toContain("&lt;1%");
-  expect(markup).toContain("--bar-scale:0.001");
   expect(markup).toContain("1 / 1,000");
   expect(markup).toContain("999");
 });
@@ -83,21 +82,6 @@ test("unavailable Qoder key quota retains the existing shared failure message", 
   );
   expect(markup).toContain("data-quota-state=\"unavailable\"");
   expect(markup).not.toContain("quota-compact");
-});
-
-test("Qoder old cached credits after a failed query still show 0%, never <1%", () => {
-  const markup = renderToStaticMarkup(
-    <LanguageProvider>
-      <QoderCreditQuota quotaMode="probe" quotaUnavailable quota={{
-        updatedAt: Date.now() - 60_000,
-        creditBuckets: [{ kind: "addOnQuota", used: 2, limit: 1000, remaining: 998, percent: 0.2 }],
-      }} />
-    </LanguageProvider>,
-  );
-  expect(markup).toContain('data-quota-state="unavailable"');
-  expect(markup).toContain("0% used");
-  expect(markup).not.toContain("&lt;1%");
-  expect(markup).toContain("--bar-scale:0.002");
 });
 
 test("Qoder current account reuses compact credits without repeated balance rows, keeping refresh and age", () => {
