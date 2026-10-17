@@ -17,6 +17,7 @@ test("Qoder key quota reuses compact bars, orders plan before add-on, and shows 
     </LanguageProvider>,
   );
   expect(markup).toContain("quota-compact");
+  expect(markup).toContain("qoder-credit-quota");
   expect(markup).not.toContain("pws-capacity-details");
   expect(markup.indexOf("Plan Credits")).toBeLessThan(markup.indexOf("Add-on Pack"));
   expect(markup).toContain("No quota");
@@ -65,6 +66,7 @@ test("Qoder provider dashboard routes credits to the compact renderer", () => {
   );
   expect(markup).toContain("pws-dashboard-row-bars");
   expect(markup).toContain("quota-compact");
+  expect(markup).toContain("qoder-credit-quota");
   expect(markup).not.toContain("pws-capacity-details");
   expect(markup).not.toContain("&lt;1%");
 });

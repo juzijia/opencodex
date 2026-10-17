@@ -1,4 +1,5 @@
 import { useI18n, useT } from "../../i18n/shared";
+import "./qoder-credit-quota.css";
 import { accountQuotaFromReport } from "../../provider-workspace/report";
 import QuotaBars from "../QuotaBars";
 import ProviderAccountQuota from "./ProviderAccountQuota";
@@ -19,7 +20,7 @@ export default function QoderCreditQuota(reading: AccountQuotaReading) {
       - (b.kind === "userQuota" ? 0 : b.kind === "addOnQuota" ? 1 : 2),
   );
   return (
-    <div className="quota-stacked" data-quota-state="ready">
+    <div className="quota-stacked qoder-credit-quota" data-quota-state="ready">
       {buckets.map((bucket, index) => (
         <div key={`${bucket.kind}-${index}`}>
           <QuotaBars
