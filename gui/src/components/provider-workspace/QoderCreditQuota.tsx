@@ -24,13 +24,7 @@ export default function QoderCreditQuota(reading: AccountQuotaReading) {
       {buckets.map((bucket, index) => (
         <div key={`${bucket.kind}-${index}`}>
           <QuotaBars
-            quota={{
-              updatedAt: quota.updatedAt,
-              creditBuckets: [{
-                ...bucket,
-                percent: bucket.percent !== undefined && bucket.percent < 1 ? 0 : bucket.percent,
-              }],
-            }}
+            quota={{ updatedAt: quota.updatedAt, creditBuckets: [bucket] }}
             threshold={80}
             t={t}
             layout="compact"

@@ -454,7 +454,6 @@ function QuotaRow({
     : undefined;
   const hasReset = reset.day !== "" || reset.time !== "";
   const tag = bcp47(locale);
-  const isTinyPercent = Boolean(isCreditBucket && typeof percent === "number" && percent > 0 && percent < 1);
   return (
     <div className={`quota-row${credits ? " quota-row--credits" : ""}${warn ? " quota-row--warn" : ""}${exhausted ? " quota-row--exhausted" : ""}`}>
       <span className="quota-label" title={resetTitle}>{label}</span>
@@ -474,7 +473,7 @@ function QuotaRow({
           t("quota.noQuota")
         ) : hasPercent ? (
           <>
-            {isTinyPercent ? "<1%" : `${Math.round(percent!)}%`}
+            {`${percent! < 1 ? 0 : Math.round(percent!)}%`}
             {exhausted ? ` · ${t("quota.limitReached")}` : ""}
           </>
         ) : (
@@ -499,7 +498,6 @@ function StackedQuotaRow({ row, threshold, t, locale, incomplete }: {
   const color = quotaBarTone(row.percent, threshold);
   const resetText = formatResetFuture(row.resetAt, t, locale);
   const tag = bcp47(locale);
-  const isTinyPercent = Boolean(row.isCreditBucket && typeof row.percent === "number" && row.percent > 0 && row.percent < 1);
   return (
     <div className={`quota-stacked-row${warn ? " quota-stacked-row--warn" : ""}${exhausted ? " quota-stacked-row--exhausted" : ""}`}>
       <div className="quota-stacked-head">
@@ -529,7 +527,7 @@ function StackedQuotaRow({ row, threshold, t, locale, incomplete }: {
               <div className={`bar-fill ${color}`} style={barFillStyle(row.percent!, row.isCreditBucket)} />
             </div>
             <span className={`quota-stacked-used${warn ? " quota-stacked-used--warn" : ""}`}>
-              {t("quota.usedPercent", { pct: isTinyPercent ? "<1" : Math.round(row.percent!) })}
+              {t("quota.usedPercent", { pct: row.percent! < 1 ? 0 : Math.round(row.percent!) })}
             </span>
           </>
         ) : (
