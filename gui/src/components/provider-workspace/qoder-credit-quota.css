@@ -19,6 +19,7 @@
   grid-column: 1;
   grid-row: 1;
   overflow-wrap: anywhere;
+  font-weight: 600;
 }
 
 .qoder-credit-quota .quota-row--credits .bar {
