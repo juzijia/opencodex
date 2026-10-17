@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import QoderCreditQuota from "../src/components/provider-workspace/QoderCreditQuota";
+import ProviderAuthPanel from "../src/components/provider-workspace/ProviderAuthPanel";
 import QoderCurrentQuota from "../src/components/provider-workspace/QoderCurrentQuota";
 import ProviderUsage from "../src/components/provider-workspace/ProviderUsage";
 import ProviderOverviewDashboard from "../src/components/provider-workspace/ProviderOverviewDashboard";
@@ -125,4 +126,27 @@ test("usage tab selects the Qoder renderer while other providers keep the shared
   const other = render("other-provider");
   expect(other).not.toContain("qoder-credit-quota");
   expect(other).toContain("pws-capacity-details");
+});
+
+test("only Qoder active API key gets the selected-card border class", () => {
+  const renderKeys = (name: string) => renderToStaticMarkup(
+    <LanguageProvider>
+      <ProviderAuthPanel
+        item={{ name, adapter: name, baseUrl: "https://example.org", authMode: "key", hasApiKey: true }}
+        apiBase=""
+        authHandlers={{} as Parameters<typeof ProviderAuthPanel>[0]["authHandlers"]}
+        keys={[
+          { id: "active", masked: "active-key", active: true },
+          { id: "inactive", masked: "inactive-key", active: false },
+        ]}
+      />
+    </LanguageProvider>,
+  );
+  const qoderCards = Array.from(renderKeys("qoder").matchAll(/<li class="([^"]*pwi-auth-acct[^"]*)"/g), m => m[1]);
+  expect(qoderCards).toHaveLength(2);
+  expect(qoderCards[0]).toContain("pwi-auth-acct--qoder");
+  expect(qoderCards[0]).toContain("pwi-auth-acct--active");
+  expect(qoderCards[1]).toContain("pwi-auth-acct--qoder");
+  expect(qoderCards[1]).not.toContain("pwi-auth-acct--active");
+  expect(renderKeys("other-provider")).not.toContain("pwi-auth-acct--qoder");
 });

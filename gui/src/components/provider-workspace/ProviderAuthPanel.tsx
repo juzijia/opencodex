@@ -718,7 +718,7 @@ export default function ProviderAuthPanel({
             {keys.length > 0 && (
               <ul className="pwi-auth-list">
                 {keys.map(entry => (
-                  <li key={entry.id} className={`pwi-auth-acct${entry.active ? " pwi-auth-acct--active" : ""}`}>
+                  <li key={entry.id} className={`pwi-auth-acct${entry.active ? " pwi-auth-acct--active" : ""}${item.name === "qoder" ? " pwi-auth-acct--qoder" : ""}`}>
                     <div className={`pwi-auth-row${entry.active ? " pwi-auth-row--active" : ""}`}>
                     <button type="button" className="pwi-auth-row-main"
                       onClick={() => void authHandlers.onSwitchApiKey(item.name, entry)}
