@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import QoderCreditQuota from "../src/components/provider-workspace/QoderCreditQuota";
+import QoderCurrentQuota from "../src/components/provider-workspace/QoderCurrentQuota";
+import ProviderUsage from "../src/components/provider-workspace/ProviderUsage";
 import ProviderOverviewDashboard from "../src/components/provider-workspace/ProviderOverviewDashboard";
 import { LanguageProvider } from "../src/i18n/provider";
 
@@ -79,4 +81,48 @@ test("unavailable Qoder key quota retains the existing shared failure message", 
   );
   expect(markup).toContain("data-quota-state=\"unavailable\"");
   expect(markup).not.toContain("quota-compact");
+});
+
+test("Qoder current account reuses compact credits without repeated balance rows, keeping refresh and age", () => {
+  const quota = {
+    updatedAt: Date.now() - 60_000,
+    creditBuckets: [
+      { kind: "userQuota", used: 0, limit: 0, remaining: 0, percent: 0 },
+      { kind: "addOnQuota", used: 400, limit: 2000, remaining: 1600, percent: 20 },
+    ],
+  };
+  const markup = renderToStaticMarkup(
+    <LanguageProvider>
+      <QoderCurrentQuota report={{ quota, updatedAt: quota.updatedAt }} onRefreshQuota={async () => true} />
+    </LanguageProvider>,
+  );
+  expect(markup).toContain("qoder-credit-quota");
+  expect(markup).toContain("quota-compact");
+  expect(markup).not.toContain("pws-capacity-details");
+  expect(markup.indexOf("Plan Credits")).toBeLessThan(markup.indexOf("Add-on Pack"));
+  expect(markup).toContain("400 / 2,000");
+  expect(markup).toContain("1,600");
+  expect(markup).toContain("pws-quota-refresh");
+  expect(markup).toContain("pws-usage-meta");
+});
+
+test("usage tab selects the Qoder renderer while other providers keep the shared renderer", () => {
+  const quota = {
+    updatedAt: Date.now(),
+    creditBuckets: [{ kind: "addOnQuota", used: 400, limit: 2000, remaining: 1600, percent: 20 }],
+  };
+  const render = (name: string) => renderToStaticMarkup(
+    <LanguageProvider>
+      <ProviderUsage
+        item={{ name, adapter: name, baseUrl: "https://example.org", authMode: "key" }}
+        quotaReport={{ quota, updatedAt: quota.updatedAt }}
+      />
+    </LanguageProvider>,
+  );
+  const qoder = render("qoder");
+  expect(qoder).toContain("qoder-credit-quota");
+  expect(qoder).not.toContain("pws-capacity-details");
+  const other = render("other-provider");
+  expect(other).not.toContain("qoder-credit-quota");
+  expect(other).toContain("pws-capacity-details");
 });
