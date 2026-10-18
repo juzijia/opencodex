@@ -123,7 +123,7 @@ export function ProviderCapacityQuota({ report, pending }: { report: ProviderQuo
             return [
               <div className="pws-capacity-recovery" key={bucket.kind || index}>
                 <span>{label}</span>
-                <strong>{`${t("codexAuth.creditsRemaining")} ${formattedRemaining}`}</strong>
+                <strong>{t("quota.creditsRemainingAmount", { n: formattedRemaining })}</strong>
               </div>
             ];
           })}

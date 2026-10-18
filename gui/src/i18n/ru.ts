@@ -1641,6 +1641,7 @@ export const ru: Record<TKey, string> = {
   "quota.addOnQuota": "Дополнительный пакет",
   "quota.creditsBalance": "Остаток кредитов",
   "quota.creditsPeriodEnds": "Расчётный период заканчивается {date}",
+  "quota.creditsRemainingAmount": "осталось {n}",
   "quota.usedPercent": "Использовано {pct}%",
   "quota.noQuota": "Нет квоты",
   "quota.limitReached": "Лимит исчерпан",

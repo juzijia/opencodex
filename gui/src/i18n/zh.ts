@@ -2819,6 +2819,7 @@ export const zh: Record<TKey, string> = {
   "quota.addOnQuota": "资源包",
   "quota.creditsBalance": "额度余额",
   "quota.creditsPeriodEnds": "账单周期结束于 {date}",
+  "quota.creditsRemainingAmount": "剩余 {n}",
   "quota.usedPercent": "已用 {pct}%",
   "quota.noQuota": "无配额",
   "quota.limitReached": "已达上限",

@@ -1682,6 +1682,7 @@ export const en = {
   "quota.addOnQuota": "Add-on Pack",
   "quota.creditsBalance": "Credits balance",
   "quota.creditsPeriodEnds": "Billing period ends {date}",
+  "quota.creditsRemainingAmount": "{n} remaining",
   "quota.usedPercent": "{pct}% used",
   "quota.noQuota": "No quota",
   "quota.limitReached": "Limit reached",

@@ -1655,6 +1655,7 @@ export const fr: Record<TKey, string> = {
   "quota.addOnQuota": "Pack additionnel",
   "quota.creditsBalance": "Solde de crédits",
   "quota.creditsPeriodEnds": "La période de facturation se termine le {date}",
+  "quota.creditsRemainingAmount": "{n} restants",
   "quota.usedPercent": "{pct} % utilisés",
   "quota.noQuota": "Aucun quota",
   "quota.limitReached": "Limite atteinte",

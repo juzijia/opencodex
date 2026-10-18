@@ -34,7 +34,7 @@ export default function QoderCreditQuota(reading: AccountQuotaReading) {
               <span>{`${format.format(bucket.used)} / ${format.format(bucket.limit)}`}</span>
             )}
             {bucket.remaining !== undefined && (
-              <strong>{t("codexAuth.creditsRemaining")} {format.format(bucket.remaining)}</strong>
+              <strong>{t("quota.creditsRemainingAmount", { n: format.format(bucket.remaining) })}</strong>
             )}
           </div>
         </div>

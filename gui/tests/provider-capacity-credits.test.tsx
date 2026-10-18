@@ -70,9 +70,10 @@ test("pure credit buckets render capacity details without currency symbol", () =
   expect(markup).toContain("pws-capacity-details");
   expect(markup).toContain("Plan Credits");
   expect(markup).toContain("Add-on Pack");
-  expect(markup).toContain("1,000");
-  expect(markup).toContain("1,477");
-  expect(markup).toContain("remaining");
+  expect(markup).toContain("1,000 remaining");
+  expect(markup).toContain("1,477 remaining");
+  expect(markup).not.toContain("remaining 1,000");
+  expect(markup).not.toContain("remaining 1,477");
   expect(markup).not.toContain("$");
   expect(markup).not.toContain("USD");
 });

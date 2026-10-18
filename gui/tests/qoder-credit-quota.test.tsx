@@ -1,3 +1,4 @@
+import { DICTS, I18nContext, interpolate, type Locale, type TFn, type TKey, type Vars } from "../src/i18n/shared";
 import { expect, test } from "bun:test";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -25,9 +26,10 @@ test("Qoder compact rows sort plan before add-on and show balances without USD",
   expect(markup).toContain("quota-compact");
   expect(markup).toContain("qoder-credit-quota");
   expect(markup.indexOf("Plan Credits")).toBeLessThan(markup.indexOf("Add-on Pack"));
-  for (const text of ["No quota", "0 / 0", "627 / 2,700", "2,073", "remaining", "--bar-scale:0.2322"]) {
+  for (const text of ["No quota", "0 / 0", "627 / 2,700", "2,073 remaining", "--bar-scale:0.2322"]) {
     expect(markup).toContain(text);
   }
+  expect(markup).not.toContain("remaining 2,073");
   expect(markup).not.toContain("pws-capacity-details");
   expect(markup).not.toContain("USD");
 });
@@ -72,9 +74,10 @@ test("Overview respects selected account, refresh, age and non-Qoder fallback", 
       onRefreshQuota={async () => true}
     />);
   const qoder = render("qoder");
-  for (const text of ["qoder-credit-quota", "quota-compact", "400 / 2,000", "1,600", "pws-quota-refresh", "pws-usage-meta", "Quota updated"]) {
+  for (const text of ["qoder-credit-quota", "quota-compact", "400 / 2,000", "1,600 remaining", "pws-quota-refresh", "pws-usage-meta", "Quota updated"]) {
     expect(qoder).toContain(text);
   }
+  expect(qoder).not.toContain("remaining 1,600");
   expect(qoder.indexOf("Plan Credits")).toBeLessThan(qoder.indexOf("Add-on Pack"));
   expect(qoder.match(/1,600/g)).toHaveLength(1);
   expect(qoder).not.toContain("99%");
@@ -110,9 +113,11 @@ test("API key cards keep separate PAT balances and only one active-key marker", 
     ]}
   />);
   const qoder = render("qoder");
-  for (const text of ["qoder-credit-quota", "No quota", "0 / 0", "400 / 2,000", "1,600", "900"]) {
+  for (const text of ["qoder-credit-quota", "No quota", "0 / 0", "400 / 2,000", "1,600 remaining", "900 remaining"]) {
     expect(qoder).toContain(text);
   }
+  expect(qoder).not.toContain("remaining 1,600");
+  expect(qoder).not.toContain("remaining 900");
   const cards = Array.from(qoder.matchAll(/<li class="([^"]*pwi-auth-acct[^"]*)"/g), match => match[1]);
   expect(cards).toHaveLength(2);
   expect(cards[0]).toContain("pwi-auth-acct--qoder");
@@ -122,4 +127,46 @@ test("API key cards keep separate PAT balances and only one active-key marker", 
   const other = render("other-provider");
   expect(other).not.toContain("pwi-auth-acct--qoder");
   expect(other).not.toContain("qoder-credit-quota");
+});
+
+test("Qoder remaining credits renders localized natural word order across locales", () => {
+  const renderIn = (locale: Locale) => {
+    const dict = DICTS[locale];
+    const t = ((key: TKey, vars?: Vars) => interpolate(dict[key] ?? key, vars)) as TFn;
+    return renderToStaticMarkup(
+      <I18nContext.Provider value={{ t, locale, setLocale: () => {} }}>
+        <QoderCreditQuota quotaMode="probe" quota={{
+          updatedAt: 1,
+          creditBuckets: [{ kind: "addOnQuota", used: 100, limit: 1000, remaining: 900, percent: 10 }],
+        }} />
+      </I18nContext.Provider>,
+    );
+  };
+  const enMarkup = renderIn("en");
+  expect(enMarkup).toContain("900 remaining");
+  expect(enMarkup).not.toContain("remaining 900");
+
+  const zhMarkup = renderIn("zh");
+  expect(zhMarkup).toContain("剩余 900");
+
+  const jaMarkup = renderIn("ja");
+  expect(jaMarkup).toContain("残り 900");
+
+  const deMarkup = renderIn("de");
+  expect(deMarkup).toContain("900 verbleibend");
+});
+
+test("missing remaining vs zero remaining semantics are strictly differentiated", () => {
+  const withZero = html(<QoderCreditQuota quotaMode="probe" quota={{
+    updatedAt: 1,
+    creditBuckets: [{ kind: "addOnQuota", used: 1000, limit: 1000, remaining: 0, percent: 100 }],
+  }} />);
+  expect(withZero).toContain("0 remaining");
+
+  const withoutRemaining = html(<QoderCreditQuota quotaMode="probe" quota={{
+    updatedAt: 1,
+    creditBuckets: [{ kind: "addOnQuota", used: 500, limit: 1000, percent: 50 }],
+  }} />);
+  expect(withoutRemaining).toContain("500 / 1,000");
+  expect(withoutRemaining).not.toContain("remaining");
 });

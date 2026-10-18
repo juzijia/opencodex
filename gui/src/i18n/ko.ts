@@ -2846,6 +2846,7 @@ export const ko: Record<TKey, string> = {
   "quota.addOnQuota": "추가 팩",
   "quota.creditsBalance": "크레딧 잔액",
   "quota.creditsPeriodEnds": "청구 기간 종료: {date}",
+  "quota.creditsRemainingAmount": "{n} 남음",
   "quota.usedPercent": "{pct}% 사용",
   "quota.noQuota": "할당량 없음",
   "quota.limitReached": "한도 도달",

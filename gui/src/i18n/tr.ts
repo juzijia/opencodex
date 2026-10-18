@@ -1668,6 +1668,7 @@ export const tr: Record<TKey, string> = {
   "quota.addOnQuota": "Ek paket",
   "quota.creditsBalance": "Kredi bakiyesi",
   "quota.creditsPeriodEnds": "Faturalandırma dönemi {date} tarihinde sona erer",
+  "quota.creditsRemainingAmount": "{n} kaldı",
   "quota.usedPercent": "%{pct} kullanıldı",
   "quota.noQuota": "Kota yok",
   "quota.limitReached": "Limite ulaşıldı",

@@ -2799,6 +2799,7 @@ export const de: Record<TKey, string> = {
   "quota.addOnQuota": "Zusatzpaket",
   "quota.creditsBalance": "Guthabenstand",
   "quota.creditsPeriodEnds": "Abrechnungszeitraum endet am {date}",
+  "quota.creditsRemainingAmount": "{n} verbleibend",
   "quota.usedPercent": "{pct} % genutzt",
   "quota.noQuota": "Kein Kontingent",
   "quota.limitReached": "Limit erreicht",
