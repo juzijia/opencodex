@@ -263,6 +263,18 @@ test("absence, explicit null and unavailable last-good remain distinct in JSON",
   expect(formatAccountTable(projectApiKeyQuotaRows(body(keys), "openrouter").rows, true)).toContain("probe: unavailable");
 });
 
+test("quota key rows keep the pause flag and only known pause details", () => {
+  const rows = projectApiKeyQuotaRows(body([
+    row({ disabled: true, pauseDetails: { reason: "subscription_expired", pausedAt: 1 } }),
+    row({ id: "second", disabled: true, pauseDetails: { reason: "reason_from_a_newer_proxy", pausedAt: 2 } }),
+    row({ id: "third" }),
+  ]), "openrouter").rows;
+  expect(rows[0]).toMatchObject({ paused: true, pauseDetails: { reason: "subscription_expired", pausedAt: 1 } });
+  expect(rows[1]!.paused).toBe(true);
+  expect(rows[1]!.pauseDetails).toBeUndefined();
+  expect(rows[2]!.paused).toBe(false);
+});
+
 for (const entry of ["account refresh", "provider quota"] as const) {
   test(`${entry} preserves Credits in text and JSON without changing other reports`, async () => {
     const creditBuckets = [
