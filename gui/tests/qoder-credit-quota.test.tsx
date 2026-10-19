@@ -154,6 +154,10 @@ test("Qoder remaining credits renders localized natural word order across locale
 
   const deMarkup = renderIn("de");
   expect(deMarkup).toContain("900 verbleibend");
+
+  const ptMarkup = renderIn("pt");
+  expect(ptMarkup).toContain("Saldo restante: 900");
+  expect(ptMarkup).not.toContain("restantes");
 });
 
 test("missing remaining vs zero remaining semantics are strictly differentiated", () => {
@@ -169,4 +173,22 @@ test("missing remaining vs zero remaining semantics are strictly differentiated"
   }} />);
   expect(withoutRemaining).toContain("500 / 1,000");
   expect(withoutRemaining).not.toContain("remaining");
+});
+
+test("Qoder remaining credits in Portuguese formats balance neutrally for 1, 0, and 1781", () => {
+  const dict = DICTS.pt;
+  const t = ((key: TKey, vars?: Vars) => interpolate(dict[key] ?? key, vars)) as TFn;
+  const format = new Intl.NumberFormat("pt");
+  for (const remaining of [1, 0, 1781]) {
+    const markup = renderToStaticMarkup(
+      <I18nContext.Provider value={{ t, locale: "pt", setLocale: () => {} }}>
+        <QoderCreditQuota quotaMode="probe" quota={{
+          updatedAt: 1,
+          creditBuckets: [{ kind: "addOnQuota", used: 100, limit: 2000, remaining, percent: 5 }],
+        }} />
+      </I18nContext.Provider>,
+    );
+    expect(markup).toContain(`Saldo restante: ${format.format(remaining)}`);
+    expect(markup).not.toContain("restantes");
+  }
 });
